@@ -3,12 +3,12 @@ package storage
 import (
 	"bytes"
 	"context"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -22,38 +22,18 @@ var ErrObjectNotExist = errors.New("storage: object doesn't exist")
 type Client struct {
 	Retry RetryPolicy
 
-	endpoint string
-	http     *http.Client
-	tokens   *tokenSource
+	endpoint     string
+	http         *http.Client
+	tokens       *tokenSource
+	quotaProject string
+	email        string
+	key          *rsa.PrivateKey
 }
 
 func NewClient(ctx context.Context, opts ...option.ClientOption) (*Client, error) {
 	var s option.Settings
 	for _, o := range opts {
 		o(&s)
-	}
-
-	creds := s.CredentialsJSON
-	if len(creds) == 0 && s.CredentialsFile != "" {
-		b, err := os.ReadFile(s.CredentialsFile)
-		if err != nil {
-			return nil, fmt.Errorf("storage: read credentials: %w", err)
-		}
-		creds = b
-	}
-	if len(creds) == 0 {
-		return nil, errors.New("storage: credentials required: use option.WithAuthCredentialsJSON or option.WithAuthCredentialsFile")
-	}
-
-	var sa serviceAccount
-	if err := json.Unmarshal(creds, &sa); err != nil {
-		return nil, fmt.Errorf("storage: parse credentials: %w", err)
-	}
-	if s.CredentialsType != "" && string(s.CredentialsType) != sa.Type {
-		return nil, fmt.Errorf("storage: credentials type %q does not match %q", sa.Type, s.CredentialsType)
-	}
-	if sa.Type != string(option.ServiceAccount) {
-		return nil, fmt.Errorf("storage: unsupported credentials type %q", sa.Type)
 	}
 
 	hc := s.HTTPClient
@@ -64,7 +44,7 @@ func NewClient(ctx context.Context, opts ...option.ClientOption) (*Client, error
 		hc = &http.Client{Transport: tr}
 	}
 
-	ts, err := newTokenSource(sa, hc)
+	creds, err := findCredentials(ctx, s, hc)
 	if err != nil {
 		return nil, err
 	}
@@ -77,10 +57,13 @@ func NewClient(ctx context.Context, opts ...option.ClientOption) (*Client, error
 	}
 
 	return &Client{
-		Retry:    defaultRetryPolicy(),
-		endpoint: endpoint,
-		http:     hc,
-		tokens:   ts,
+		Retry:        defaultRetryPolicy(),
+		endpoint:     endpoint,
+		http:         hc,
+		tokens:       creds.tokens,
+		quotaProject: creds.quotaProject,
+		email:        creds.email,
+		key:          creds.key,
 	}, nil
 }
 
@@ -171,6 +154,9 @@ func (c *Client) roundTrip(ctx context.Context, method, u string, header http.He
 		req.Header[k] = v
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	if c.quotaProject != "" {
+		req.Header.Set("X-Goog-User-Project", c.quotaProject)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

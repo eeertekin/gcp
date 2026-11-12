@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 
 	"github.com/eeertekin/gcp/option"
@@ -25,43 +24,17 @@ var ErrEmptyProjectID = errors.New("pubsub: projectID string is empty")
 type Client struct {
 	Retry RetryPolicy
 
-	projectID string
-	endpoint  string
-	http      *http.Client
-	tokens    *tokenSource
+	projectID    string
+	quotaProject string
+	endpoint     string
+	http         *http.Client
+	tokens       *tokenSource
 }
 
 func NewClient(ctx context.Context, projectID string, opts ...option.ClientOption) (*Client, error) {
 	var s option.Settings
 	for _, o := range opts {
 		o(&s)
-	}
-
-	creds := s.CredentialsJSON
-	if len(creds) == 0 && s.CredentialsFile != "" {
-		b, err := os.ReadFile(s.CredentialsFile)
-		if err != nil {
-			return nil, fmt.Errorf("pubsub: read credentials: %w", err)
-		}
-		creds = b
-	}
-	if len(creds) == 0 {
-		return nil, errors.New("pubsub: credentials required: use option.WithAuthCredentialsJSON or option.WithAuthCredentialsFile")
-	}
-
-	var sa serviceAccount
-	if err := json.Unmarshal(creds, &sa); err != nil {
-		return nil, fmt.Errorf("pubsub: parse credentials: %w", err)
-	}
-	if s.CredentialsType != "" && string(s.CredentialsType) != sa.Type {
-		return nil, fmt.Errorf("pubsub: credentials type %q does not match %q", sa.Type, s.CredentialsType)
-	}
-	if sa.Type != string(option.ServiceAccount) {
-		return nil, fmt.Errorf("pubsub: unsupported credentials type %q", sa.Type)
-	}
-
-	if projectID == DetectProjectID {
-		projectID = sa.ProjectID
 	}
 	if projectID == "" {
 		return nil, ErrEmptyProjectID
@@ -72,9 +45,16 @@ func NewClient(ctx context.Context, projectID string, opts ...option.ClientOptio
 		// Pulls are long polls, so deadlines are set per request instead of on the client.
 		hc = &http.Client{}
 	}
-	ts, err := newTokenSource(sa, hc)
+	creds, err := findCredentials(ctx, s, hc)
 	if err != nil {
 		return nil, err
+	}
+
+	if projectID == DetectProjectID {
+		projectID = creds.projectID
+	}
+	if projectID == "" {
+		return nil, ErrEmptyProjectID
 	}
 
 	endpoint := strings.TrimSuffix(s.Endpoint, "/")
@@ -85,11 +65,12 @@ func NewClient(ctx context.Context, projectID string, opts ...option.ClientOptio
 	}
 
 	return &Client{
-		Retry:     defaultRetryPolicy(),
-		projectID: projectID,
-		endpoint:  endpoint,
-		http:      hc,
-		tokens:    ts,
+		Retry:        defaultRetryPolicy(),
+		projectID:    projectID,
+		quotaProject: creds.quotaProject,
+		endpoint:     endpoint,
+		http:         hc,
+		tokens:       creds.tokens,
 	}, nil
 }
 
@@ -168,6 +149,9 @@ func (c *Client) attempt(ctx context.Context, u string, payload []byte, out any)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
+	if c.quotaProject != "" {
+		req.Header.Set("X-Goog-User-Project", c.quotaProject)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

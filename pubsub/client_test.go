@@ -18,6 +18,9 @@ import (
 )
 
 func TestNewClientCredentials(t *testing.T) {
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	t.Setenv("CLOUDSDK_CONFIG", t.TempDir())
+	t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
 	ctx := context.Background()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -73,12 +76,14 @@ func TestNewClientCredentials(t *testing.T) {
 	}
 
 	bad := map[string][]option.ClientOption{
-		"no credentials": nil,
-		"missing file":   {option.WithAuthCredentialsFile(option.ServiceAccount, filepath.Join(t.TempDir(), "nope.json"))},
-		"type mismatch":  {option.WithAuthCredentialsJSON("authorized_user", valid)},
-		"invalid json":   {option.WithAuthCredentialsJSON(option.ServiceAccount, []byte("{"))},
-		"bad pem":        {option.WithAuthCredentialsJSON(option.ServiceAccount, creds(func(m map[string]string) { m["private_key"] = "x" }))},
-		"no email":       {option.WithAuthCredentialsJSON(option.ServiceAccount, creds(func(m map[string]string) { delete(m, "client_email") }))},
+		"no credentials":  nil,
+		"missing file":    {option.WithAuthCredentialsFile(option.ServiceAccount, filepath.Join(t.TempDir(), "nope.json"))},
+		"type mismatch":   {option.WithAuthCredentialsJSON("authorized_user", valid)},
+		"invalid json":    {option.WithAuthCredentialsJSON(option.ServiceAccount, []byte("{"))},
+		"bad pem":         {option.WithAuthCredentialsJSON(option.ServiceAccount, creds(func(m map[string]string) { m["private_key"] = "x" }))},
+		"unsupported":     {option.WithAuthCredentialsJSON("", creds(func(m map[string]string) { m["type"] = "external_account" }))},
+		"incomplete user": {option.WithAuthCredentialsJSON(option.AuthorizedUser, creds(func(m map[string]string) { m["type"] = "authorized_user" }))},
+		"no email":        {option.WithAuthCredentialsJSON(option.ServiceAccount, creds(func(m map[string]string) { delete(m, "client_email") }))},
 	}
 	for name, opts := range bad {
 		if _, err := NewClient(ctx, "p", opts...); err == nil {

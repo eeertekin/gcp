@@ -37,7 +37,7 @@ func TestSignedURLConformance(t *testing.T) {
 		Cases []v4Case `json:"signingV4Tests"`
 	}
 	readJSON(t, "testdata/v4_signatures.json", &data)
-	var sa serviceAccount
+	var sa credentialsFile
 	saJSON := readJSON(t, "testdata/test_service_account.not-a-test.json", &sa)
 	key, err := signer(&SignedURLOptions{PrivateKey: []byte(sa.PrivateKey)})
 	if err != nil {

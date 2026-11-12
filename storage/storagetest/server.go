@@ -29,10 +29,14 @@ import (
 )
 
 const (
-	Bucket      = "test-bucket"
-	ClientEmail = "sa@test-project.iam.gserviceaccount.com"
-	KeyID       = "kid-1"
-	chunkAlign  = 256 << 10
+	Bucket           = "test-bucket"
+	ProjectID        = "test-project"
+	ClientEmail      = "sa@test-project.iam.gserviceaccount.com"
+	KeyID            = "kid-1"
+	UserClientID     = "user-client-id"
+	UserClientSecret = "user-client-secret"
+	UserRefreshToken = "user-refresh-token"
+	chunkAlign       = 256 << 10
 )
 
 type Object struct {
@@ -64,19 +68,20 @@ type Server struct {
 	srv   *httptest.Server
 	creds []byte
 
-	mu          sync.Mutex
-	calls       []string
-	tokenCalls  int
-	tokenTTL    int
-	rejectToken bool
-	lastToken   string
-	buckets     map[string]bool
-	objects     map[string]*Object
-	sessions    map[string]*session
-	generation  int64
-	attempts    int
-	faults      []Fault
-	tokenFaults []int
+	mu           sync.Mutex
+	calls        []string
+	tokenCalls   int
+	tokenTTL     int
+	rejectToken  bool
+	lastToken    string
+	buckets      map[string]bool
+	objects      map[string]*Object
+	sessions     map[string]*session
+	generation   int64
+	attempts     int
+	faults       []Fault
+	tokenFaults  []int
+	quotaProject string
 }
 
 func NewServer(t testing.TB) (*Server, *storage.Client) {
@@ -98,6 +103,8 @@ func NewServer(t testing.TB) (*Server, *storage.Client) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /token", s.handleToken)
+	mux.HandleFunc("GET /computeMetadata/v1/project/project-id", s.handleMetadataProject)
+	mux.HandleFunc("GET /computeMetadata/v1/instance/service-accounts/default/token", s.handleMetadataToken)
 	mux.HandleFunc("DELETE /storage/v1/b/{b}/o/{o}", s.api(s.handleDelete))
 	mux.HandleFunc("POST /upload/storage/v1/b/{b}/o", s.api(s.handleUpload))
 	mux.HandleFunc("PUT /upload/storage/v1/b/{b}/o", s.api(s.handleChunk))
@@ -131,7 +138,7 @@ func (s *Server) credentials(key *rsa.PrivateKey) []byte {
 	}
 	b, _ := json.Marshal(map[string]string{
 		"type":           "service_account",
-		"project_id":     "test-project",
+		"project_id":     ProjectID,
 		"private_key_id": KeyID,
 		"private_key":    string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})),
 		"client_email":   ClientEmail,
@@ -265,21 +272,59 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
-	if gt := r.PostForm.Get("grant_type"); gt != "urn:ietf:params:oauth:grant-type:jwt-bearer" {
+	switch gt := r.PostForm.Get("grant_type"); gt {
+	case "urn:ietf:params:oauth:grant-type:jwt-bearer":
+		if err := s.verifyJWT(r.PostForm.Get("assertion")); err != nil {
+			s.t.Errorf("storagetest: token: %s", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	case "refresh_token":
+		f := r.PostForm
+		if f.Get("client_id") != UserClientID || f.Get("client_secret") != UserClientSecret || f.Get("refresh_token") != UserRefreshToken {
+			s.t.Errorf("storagetest: token: bad refresh_token grant %v", f)
+			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+			return
+		}
+	default:
 		s.t.Errorf("storagetest: token: grant_type = %q", gt)
-	}
-	if err := s.verifyJWT(r.PostForm.Get("assertion")); err != nil {
-		s.t.Errorf("storagetest: token: %s", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, `{"error":"unsupported_grant_type"}`, http.StatusBadRequest)
 		return
 	}
+	s.issueToken(w)
+}
 
+func (s *Server) issueToken(w http.ResponseWriter) {
 	s.lastToken = fmt.Sprintf("tok-%d", s.tokenCalls)
 	json.NewEncoder(w).Encode(map[string]any{
 		"access_token": s.lastToken,
 		"expires_in":   s.tokenTTL,
 		"token_type":   "Bearer",
 	})
+}
+
+func (s *Server) handleMetadataProject(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Metadata-Flavor") != "Google" {
+		s.t.Errorf("storagetest: metadata project-id without Metadata-Flavor header")
+		http.Error(w, "missing Metadata-Flavor", http.StatusForbidden)
+		return
+	}
+	io.WriteString(w, ProjectID)
+}
+
+func (s *Server) handleMetadataToken(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tokenCalls++
+	if r.Header.Get("Metadata-Flavor") != "Google" {
+		s.t.Errorf("storagetest: metadata token without Metadata-Flavor header")
+		http.Error(w, "missing Metadata-Flavor", http.StatusForbidden)
+		return
+	}
+	if !strings.Contains(r.URL.Query().Get("scopes"), "https://www.googleapis.com/auth/devstorage.") {
+		s.t.Errorf("storagetest: metadata token scopes = %q", r.URL.Query().Get("scopes"))
+	}
+	s.issueToken(w)
 }
 
 func (s *Server) verifyJWT(assertion string) error {
@@ -337,6 +382,7 @@ func (s *Server) verifyJWT(assertion string) error {
 }
 
 func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
+	s.quotaProject = r.Header.Get("X-Goog-User-Project")
 	got := r.Header.Get("Authorization")
 	if s.lastToken == "" || got != "Bearer "+s.lastToken {
 		writeAPIError(w, http.StatusUnauthorized, "authError", "bad token "+got)
@@ -549,6 +595,30 @@ func (s *Server) URL() string {
 
 func (s *Server) Credentials() []byte {
 	return s.creds
+}
+
+func (s *Server) AuthorizedUserJSON() []byte {
+	b, _ := json.Marshal(map[string]string{
+		"type":             "authorized_user",
+		"client_id":        UserClientID,
+		"client_secret":    UserClientSecret,
+		"refresh_token":    UserRefreshToken,
+		"quota_project_id": ProjectID,
+		"token_uri":        s.srv.URL + "/token",
+	})
+	return b
+}
+
+// Host is the host:port to use as GCE_METADATA_HOST.
+func (s *Server) Host() string {
+	return strings.TrimPrefix(s.srv.URL, "http://")
+}
+
+// QuotaProject is the X-Goog-User-Project header of the last API request.
+func (s *Server) QuotaProject() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.quotaProject
 }
 
 func (s *Server) handleSignedGet(w http.ResponseWriter, r *http.Request) {

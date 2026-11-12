@@ -10,8 +10,8 @@ Same program using all three services (BigQuery dataset metadata/create/load/cop
 
 | | Official SDKs | stdlib | Difference |
 |---|---|---|---|
-| Stripped binary (`-s -w`) | 39.25 MB | **6.93 MB** | 5.7× smaller |
-| Default binary | 57.34 MB | **10.16 MB** | 5.6× smaller |
+| Stripped binary (`-s -w`) | 39.25 MB | **6.95 MB** | 5.6× smaller |
+| Default binary | 57.34 MB | **10.18 MB** | 5.6× smaller |
 | Modules (`go list -m all`) | 164 | **1** | |
 | Modules linked | 59 | **1** | |
 | Non-standard packages | 534 | **7** | |
@@ -21,10 +21,10 @@ Per service (stripped / default binary):
 
 | Service | Official SDK | stdlib |
 |---|---|---|
-| Storage only | 32.27 MB / 47.23 MB | 6.70 MB / 9.83 MB |
-| Pub/Sub only | 16.81 MB / 24.62 MB | 6.70 MB / 9.83 MB |
+| Storage only | 32.27 MB / 47.23 MB | 6.71 MB / 9.84 MB |
+| Pub/Sub only | 16.81 MB / 24.62 MB | 6.71 MB / 9.85 MB |
 | BigQuery only | 22.13 MB / 32.39 MB | 6.76 MB / 9.91 MB |
-| All three | 39.25 MB / 57.34 MB | 6.93 MB / 10.16 MB |
+| All three | 39.25 MB / 57.34 MB | 6.95 MB / 10.18 MB |
 
 The SDKs grow with every service because each brings its own heavy dependencies (gRPC, protobuf, OpenTelemetry, Apache Arrow, …). The stdlib packages share `net/http` and `crypto`, so adding a service costs only its own logic (~0.1 MB).
 
@@ -47,16 +47,18 @@ Each service package is self-contained (its own auth and retry code), so you can
 
 ## Authentication
 
-Storage and Pub/Sub use a **service account** key. A JWT is signed with RS256 and exchanged for an OAuth2 access token, which is cached and refreshed one minute before expiry.
+All three clients accept a **service account** key or **user credentials**. For a service account, a JWT is signed with RS256 and exchanged for an OAuth2 access token; user credentials use their refresh token, and their `quota_project_id` is sent as `X-Goog-User-Project`. Tokens are cached and refreshed one minute before expiry.
 
-BigQuery additionally supports **Application Default Credentials** when no credentials option is given: `GOOGLE_APPLICATION_CREDENTIALS`, then the gcloud file from `gcloud auth application-default login` (service account or user credentials), then the GCE / Cloud Run / GKE metadata server.
+When no credentials option is given, every client uses **Application Default Credentials**: `GOOGLE_APPLICATION_CREDENTIALS`, then the gcloud file from `gcloud auth application-default login` (service account or user credentials), then the GCE / Cloud Run / GKE metadata server. `DetectProjectID` takes the project from whichever credentials were found.
+
+Storage signed URLs need a private key. With user or metadata-server credentials, `SignedURL` returns an error unless `GoogleAccessID` and `PrivateKey` or `SignBytes` are set.
 
 ```go
 import "github.com/eeertekin/gcp/option"
 
 option.WithAuthCredentialsJSON(option.ServiceAccount, jsonBytes)
 option.WithAuthCredentialsFile(option.ServiceAccount, "/path/to/key.json")
-option.WithAuthCredentialsJSON(option.AuthorizedUser, userJSON) // BigQuery only
+option.WithAuthCredentialsJSON(option.AuthorizedUser, userJSON)
 option.WithEndpoint("https://custom-endpoint")                  // emulators, fakes, private endpoints
 option.WithHTTPClient(httpClient)                               // custom transport; auth is still added
 ```
@@ -182,8 +184,8 @@ srv.CreateSubscription("s", "t", pubsubtest.SubscriptionConfig{})
 | Package | Tests |
 |---|---|
 | `bigquery` | 59 (incl. paging, deadline-bounded polling, cancel, idempotent retry, ADC) |
-| `storage` | 50 (incl. Google's V4 signing conformance suite) |
-| `pubsub` | 42 (incl. a 600-message end-to-end publish → receive) |
+| `storage` | 55 (incl. Google's V4 signing conformance suite, ADC) |
+| `pubsub` | 46 (incl. a 600-message end-to-end publish → receive, ADC) |
 
 ```sh
 go test -race -timeout 15s ./...

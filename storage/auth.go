@@ -10,61 +10,187 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/eeertekin/gcp/option"
 )
 
 const (
-	defaultTokenURI = "https://oauth2.googleapis.com/token"
-	tokenScope      = "https://www.googleapis.com/auth/devstorage.read_write"
+	defaultTokenURI     = "https://oauth2.googleapis.com/token"
+	tokenScope          = "https://www.googleapis.com/auth/devstorage.read_write"
+	defaultMetadataHost = "metadata.google.internal"
+	metadataProbeLimit  = 3 * time.Second
 )
 
-type serviceAccount struct {
-	Type         string `json:"type"`
-	PrivateKeyID string `json:"private_key_id"`
-	PrivateKey   string `json:"private_key"`
-	ClientEmail  string `json:"client_email"`
-	TokenURI     string `json:"token_uri"`
+type credentialsFile struct {
+	Type           string `json:"type"`
+	ProjectID      string `json:"project_id"`
+	PrivateKeyID   string `json:"private_key_id"`
+	PrivateKey     string `json:"private_key"`
+	ClientEmail    string `json:"client_email"`
+	TokenURI       string `json:"token_uri"`
+	ClientID       string `json:"client_id"`
+	ClientSecret   string `json:"client_secret"`
+	RefreshToken   string `json:"refresh_token"`
+	QuotaProjectID string `json:"quota_project_id"`
 }
 
-type tokenSource struct {
-	email    string
-	keyID    string
-	tokenURI string
-	key      *rsa.PrivateKey
-	http     *http.Client
-
-	mu     sync.Mutex
-	token  string
-	expiry time.Time
+type credentials struct {
+	quotaProject string
+	tokens       *tokenSource
+	email        string
+	key          *rsa.PrivateKey
 }
 
-func newTokenSource(sa serviceAccount, hc *http.Client) (*tokenSource, error) {
-	if sa.ClientEmail == "" {
-		return nil, errors.New("storage: credentials missing client_email")
+// findCredentials follows Application Default Credentials order: explicit
+// option, GOOGLE_APPLICATION_CREDENTIALS, the gcloud ADC file, then the
+// metadata server.
+func findCredentials(ctx context.Context, s option.Settings, hc *http.Client) (*credentials, error) {
+	switch {
+	case len(s.CredentialsJSON) > 0:
+		return parseCredentials(s.CredentialsJSON, s.CredentialsType, hc)
+	case s.CredentialsFile != "":
+		data, err := os.ReadFile(s.CredentialsFile)
+		if err != nil {
+			return nil, fmt.Errorf("storage: read credentials: %w", err)
+		}
+		return parseCredentials(data, s.CredentialsType, hc)
 	}
-	block, _ := pem.Decode([]byte(sa.PrivateKey))
-	if block == nil {
-		return nil, errors.New("storage: credentials private_key is not valid PEM")
+
+	if path := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("storage: GOOGLE_APPLICATION_CREDENTIALS: %w", err)
+		}
+		return parseCredentials(data, "", hc)
 	}
-	key, err := parseRSAKey(block.Bytes)
+
+	if path := gcloudCredentialsPath(); path != "" {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return parseCredentials(data, "", hc)
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("storage: read %s: %w", path, err)
+		}
+	}
+
+	host := os.Getenv("GCE_METADATA_HOST")
+	if host == "" {
+		host = defaultMetadataHost
+	}
+	if _, err := metadataProjectID(ctx, hc, host); err != nil {
+		return nil, fmt.Errorf("storage: no credentials: set GOOGLE_APPLICATION_CREDENTIALS, run `gcloud auth application-default login`, or run on Google Cloud (metadata server: %w)", err)
+	}
+	u := "http://" + host + "/computeMetadata/v1/instance/service-accounts/default/token?scopes=" + url.QueryEscape(tokenScope)
+	return &credentials{
+		tokens: &tokenSource{tokenURI: u, http: hc, request: func(ctx context.Context) (*http.Request, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+			if err == nil {
+				req.Header.Set("Metadata-Flavor", "Google")
+			}
+			return req, err
+		}},
+	}, nil
+}
+
+func gcloudCredentialsPath() string {
+	dir := os.Getenv("CLOUDSDK_CONFIG")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		dir = filepath.Join(home, ".config", "gcloud")
+	}
+	return filepath.Join(dir, "application_default_credentials.json")
+}
+
+func metadataProjectID(ctx context.Context, hc *http.Client, host string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, metadataProbeLimit)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+host+"/computeMetadata/v1/project/project-id", nil)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	tokenURI := sa.TokenURI
+	req.Header.Set("Metadata-Flavor", "Google")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("project-id: %s", resp.Status)
+	}
+	return strings.TrimSpace(string(body)), nil
+}
+
+func parseCredentials(data []byte, want option.CredentialsType, hc *http.Client) (*credentials, error) {
+	var f credentialsFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return nil, fmt.Errorf("storage: parse credentials: %w", err)
+	}
+	if want != "" && string(want) != f.Type {
+		return nil, fmt.Errorf("storage: credentials type %q does not match %q", f.Type, want)
+	}
+	tokenURI := f.TokenURI
 	if tokenURI == "" {
 		tokenURI = defaultTokenURI
 	}
-	return &tokenSource{
-		email:    sa.ClientEmail,
-		keyID:    sa.PrivateKeyID,
-		tokenURI: tokenURI,
-		key:      key,
-		http:     hc,
-	}, nil
+
+	switch option.CredentialsType(f.Type) {
+	case option.ServiceAccount:
+		if f.ClientEmail == "" {
+			return nil, errors.New("storage: credentials missing client_email")
+		}
+		block, _ := pem.Decode([]byte(f.PrivateKey))
+		if block == nil {
+			return nil, errors.New("storage: credentials private_key is not valid PEM")
+		}
+		key, err := parseRSAKey(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		ts := &tokenSource{tokenURI: tokenURI, http: hc}
+		ts.request = func(ctx context.Context) (*http.Request, error) {
+			assertion, err := signJWT(key, f.PrivateKeyID, f.ClientEmail, tokenURI, time.Now())
+			if err != nil {
+				return nil, err
+			}
+			return tokenForm(ctx, tokenURI, url.Values{
+				"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"},
+				"assertion":  {assertion},
+			})
+		}
+		return &credentials{tokens: ts, email: f.ClientEmail, key: key}, nil
+
+	case option.AuthorizedUser:
+		if f.ClientID == "" || f.ClientSecret == "" || f.RefreshToken == "" {
+			return nil, errors.New("storage: authorized_user credentials need client_id, client_secret and refresh_token")
+		}
+		ts := &tokenSource{tokenURI: tokenURI, http: hc}
+		ts.request = func(ctx context.Context) (*http.Request, error) {
+			return tokenForm(ctx, tokenURI, url.Values{
+				"grant_type":    {"refresh_token"},
+				"client_id":     {f.ClientID},
+				"client_secret": {f.ClientSecret},
+				"refresh_token": {f.RefreshToken},
+			})
+		}
+		return &credentials{quotaProject: f.QuotaProjectID, tokens: ts}, nil
+	}
+	return nil, fmt.Errorf("storage: unsupported credentials type %q", f.Type)
 }
 
 func parseRSAKey(der []byte) (*rsa.PrivateKey, error) {
@@ -82,6 +208,40 @@ func parseRSAKey(der []byte) (*rsa.PrivateKey, error) {
 	return k, nil
 }
 
+func tokenForm(ctx context.Context, tokenURI string, form url.Values) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURI, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req, nil
+}
+
+func signJWT(key *rsa.PrivateKey, keyID, email, aud string, now time.Time) (string, error) {
+	header, err := json.Marshal(map[string]string{"alg": "RS256", "typ": "JWT", "kid": keyID})
+	if err != nil {
+		return "", err
+	}
+	claims, err := json.Marshal(map[string]any{
+		"iss":   email,
+		"scope": tokenScope,
+		"aud":   aud,
+		"iat":   now.Unix(),
+		"exp":   now.Add(time.Hour).Unix(),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	enc := base64.RawURLEncoding
+	unsigned := enc.EncodeToString(header) + "." + enc.EncodeToString(claims)
+	sig, err := signRSA(key, []byte(unsigned))
+	if err != nil {
+		return "", fmt.Errorf("storage: sign jwt: %w", err)
+	}
+	return unsigned + "." + enc.EncodeToString(sig), nil
+}
+
 type tokenError struct {
 	code int
 	err  error
@@ -89,6 +249,16 @@ type tokenError struct {
 
 func (e *tokenError) Error() string { return e.err.Error() }
 func (e *tokenError) Unwrap() error { return e.err }
+
+type tokenSource struct {
+	tokenURI string
+	http     *http.Client
+	request  func(ctx context.Context) (*http.Request, error)
+
+	mu     sync.Mutex
+	token  string
+	expiry time.Time
+}
 
 func (ts *tokenSource) Token(ctx context.Context) (string, error) {
 	ts.mu.Lock()
@@ -99,21 +269,10 @@ func (ts *tokenSource) Token(ctx context.Context) (string, error) {
 	}
 
 	now := time.Now()
-	assertion, err := ts.assertion(now)
+	req, err := ts.request(ctx)
 	if err != nil {
 		return "", err
 	}
-
-	form := url.Values{
-		"grant_type": {"urn:ietf:params:oauth:grant-type:jwt-bearer"},
-		"assertion":  {assertion},
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ts.tokenURI, strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
 	resp, err := ts.http.Do(req)
 	if err != nil {
 		return "", &tokenError{err: fmt.Errorf("storage: token exchange: %w", err)}
@@ -145,29 +304,4 @@ func (ts *tokenSource) Token(ctx context.Context) (string, error) {
 	ts.token = tok.AccessToken
 	ts.expiry = now.Add(time.Duration(tok.ExpiresIn) * time.Second)
 	return ts.token, nil
-}
-
-func (ts *tokenSource) assertion(now time.Time) (string, error) {
-	header, err := json.Marshal(map[string]string{"alg": "RS256", "typ": "JWT", "kid": ts.keyID})
-	if err != nil {
-		return "", err
-	}
-	claims, err := json.Marshal(map[string]any{
-		"iss":   ts.email,
-		"scope": tokenScope,
-		"aud":   ts.tokenURI,
-		"iat":   now.Unix(),
-		"exp":   now.Add(time.Hour).Unix(),
-	})
-	if err != nil {
-		return "", err
-	}
-
-	enc := base64.RawURLEncoding
-	unsigned := enc.EncodeToString(header) + "." + enc.EncodeToString(claims)
-	sig, err := signRSA(ts.key, []byte(unsigned))
-	if err != nil {
-		return "", fmt.Errorf("storage: sign jwt: %w", err)
-	}
-	return unsigned + "." + enc.EncodeToString(sig), nil
 }

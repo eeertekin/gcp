@@ -89,11 +89,14 @@ func (b *BucketHandle) SignedURL(object string, opts *SignedURLOptions) (string,
 		return "", errors.New("storage: missing required SignedURLOptions")
 	}
 	o := *opts
-	if o.GoogleAccessID == "" {
-		o.GoogleAccessID = b.c.tokens.email
+	if b.c.key == nil && (o.GoogleAccessID == "" || (o.SignBytes == nil && len(o.PrivateKey) == 0)) {
+		return "", errors.New("storage: client credentials have no service account key: set GoogleAccessID and PrivateKey or SignBytes")
 	}
-	if o.SignBytes == nil && len(o.PrivateKey) == 0 && o.GoogleAccessID == b.c.tokens.email {
-		key := b.c.tokens.key
+	if o.GoogleAccessID == "" {
+		o.GoogleAccessID = b.c.email
+	}
+	if o.SignBytes == nil && len(o.PrivateKey) == 0 && o.GoogleAccessID == b.c.email {
+		key := b.c.key
 		o.SignBytes = func(p []byte) ([]byte, error) { return signRSA(key, p) }
 	}
 	return signURL(b.name, object, &o, b.c.endpoint, time.Now())

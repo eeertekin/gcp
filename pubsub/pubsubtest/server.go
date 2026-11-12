@@ -25,9 +25,12 @@ import (
 )
 
 const (
-	ProjectID   = "test-project"
-	ClientEmail = "sa@test-project.iam.gserviceaccount.com"
-	KeyID       = "kid-1"
+	ProjectID        = "test-project"
+	ClientEmail      = "sa@test-project.iam.gserviceaccount.com"
+	KeyID            = "kid-1"
+	UserClientID     = "user-client-id"
+	UserClientSecret = "user-client-secret"
+	UserRefreshToken = "user-refresh-token"
 )
 
 type Message struct {
@@ -74,21 +77,22 @@ type Server struct {
 	srv   *httptest.Server
 	creds []byte
 
-	mu          sync.Mutex
-	tokenCalls  int
-	lastToken   string
-	topics      map[string][][]Message
-	subs        map[string]*subscription
-	nextID      int
-	calls       map[string]int
-	faults      []Fault
-	hold        chan struct{}
-	inflight    int
-	maxInflight int
-	keyInflight map[string]int
-	maxPerKey   int
-	pullWait    time.Duration
-	notify      chan struct{}
+	mu           sync.Mutex
+	tokenCalls   int
+	lastToken    string
+	quotaProject string
+	topics       map[string][][]Message
+	subs         map[string]*subscription
+	nextID       int
+	calls        map[string]int
+	faults       []Fault
+	hold         chan struct{}
+	inflight     int
+	maxInflight  int
+	keyInflight  map[string]int
+	maxPerKey    int
+	pullWait     time.Duration
+	notify       chan struct{}
 }
 
 var signingKey = sync.OnceValues(func() (*rsa.PrivateKey, error) {
@@ -114,6 +118,8 @@ func NewServer(t testing.TB) (*Server, *pubsub.Client) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /token", s.handleToken)
+	mux.HandleFunc("GET /computeMetadata/v1/project/project-id", s.handleMetadataProject)
+	mux.HandleFunc("GET /computeMetadata/v1/instance/service-accounts/default/token", s.handleMetadataToken)
 	mux.HandleFunc("POST /v1/projects/{p}/topics/{rest}", s.api(s.handlePublish))
 	mux.HandleFunc("POST /v1/projects/{p}/subscriptions/{rest}", s.api(s.handleSubscription))
 	s.srv = httptest.NewServer(mux)
@@ -146,6 +152,38 @@ func (s *Server) ClientOptions() []option.ClientOption {
 		option.WithAuthCredentialsJSON(option.ServiceAccount, s.creds),
 		option.WithEndpoint(s.srv.URL),
 	}
+}
+
+func (s *Server) URL() string {
+	return s.srv.URL
+}
+
+// Host is the host:port to use as GCE_METADATA_HOST.
+func (s *Server) Host() string {
+	return strings.TrimPrefix(s.srv.URL, "http://")
+}
+
+func (s *Server) ServiceAccountJSON() []byte {
+	return s.creds
+}
+
+func (s *Server) AuthorizedUserJSON() []byte {
+	b, _ := json.Marshal(map[string]string{
+		"type":             "authorized_user",
+		"client_id":        UserClientID,
+		"client_secret":    UserClientSecret,
+		"refresh_token":    UserRefreshToken,
+		"quota_project_id": ProjectID,
+		"token_uri":        s.srv.URL + "/token",
+	})
+	return b
+}
+
+// QuotaProject is the X-Goog-User-Project header of the last API request.
+func (s *Server) QuotaProject() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.quotaProject
 }
 
 func topicName(id string) string { return "projects/" + ProjectID + "/topics/" + id }
@@ -292,6 +330,7 @@ func (s *Server) api(h func(w http.ResponseWriter, r *http.Request, name, verb s
 
 		s.mu.Lock()
 		s.calls[verb]++
+		s.quotaProject = r.Header.Get("X-Goog-User-Project")
 		authorized := s.lastToken != "" && r.Header.Get("Authorization") == "Bearer "+s.lastToken
 		var f *Fault
 		for j, cand := range s.faults {
@@ -580,13 +619,55 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
-	if err := s.verifyJWT(r.PostForm.Get("assertion")); err != nil {
-		s.t.Errorf("pubsubtest: token: %s", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	switch gt := r.PostForm.Get("grant_type"); gt {
+	case "urn:ietf:params:oauth:grant-type:jwt-bearer":
+		if err := s.verifyJWT(r.PostForm.Get("assertion")); err != nil {
+			s.t.Errorf("pubsubtest: token: %s", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	case "refresh_token":
+		f := r.PostForm
+		if f.Get("client_id") != UserClientID || f.Get("client_secret") != UserClientSecret || f.Get("refresh_token") != UserRefreshToken {
+			s.t.Errorf("pubsubtest: token: bad refresh_token grant %v", f)
+			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+			return
+		}
+	default:
+		s.t.Errorf("pubsubtest: token: grant_type = %q", gt)
+		http.Error(w, `{"error":"unsupported_grant_type"}`, http.StatusBadRequest)
 		return
 	}
+	s.issueToken(w)
+}
+
+func (s *Server) issueToken(w http.ResponseWriter) {
 	s.lastToken = fmt.Sprintf("tok-%d", s.tokenCalls)
 	writeJSON(w, map[string]any{"access_token": s.lastToken, "expires_in": 3600, "token_type": "Bearer"})
+}
+
+func (s *Server) handleMetadataProject(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Metadata-Flavor") != "Google" {
+		s.t.Errorf("pubsubtest: metadata project-id without Metadata-Flavor header")
+		http.Error(w, "missing Metadata-Flavor", http.StatusForbidden)
+		return
+	}
+	io.WriteString(w, ProjectID)
+}
+
+func (s *Server) handleMetadataToken(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tokenCalls++
+	if r.Header.Get("Metadata-Flavor") != "Google" {
+		s.t.Errorf("pubsubtest: metadata token without Metadata-Flavor header")
+		http.Error(w, "missing Metadata-Flavor", http.StatusForbidden)
+		return
+	}
+	if r.URL.Query().Get("scopes") != pubsub.ScopePubSub {
+		s.t.Errorf("pubsubtest: metadata token scopes = %q", r.URL.Query().Get("scopes"))
+	}
+	s.issueToken(w)
 }
 
 func (s *Server) verifyJWT(assertion string) error {
