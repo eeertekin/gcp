@@ -10,6 +10,7 @@ import (
 
 	"github.com/eeertekin/gcp/bigquery"
 	"github.com/eeertekin/gcp/bigquery/bigquerytest"
+	"github.com/eeertekin/gcp/googleapi"
 )
 
 func TestTableDelete(t *testing.T) {
@@ -32,8 +33,10 @@ func TestTableDelete(t *testing.T) {
 	if !bigquery.IsNotFound(err) {
 		t.Fatalf("err = %v, want not found", err)
 	}
-	var apiErr *bigquery.APIError
-	if !errors.As(err, &apiErr) || apiErr.Status != "NOT_FOUND" || apiErr.Reason != "notFound" {
+	var apiErr *googleapi.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != http.StatusNotFound || len(apiErr.Errors) != 1 ||
+		apiErr.Errors[0].Reason != "notFound" || apiErr.Message != "Not found: Table ds/t" ||
+		!strings.Contains(apiErr.Body, `"status":"NOT_FOUND"`) {
 		t.Fatalf("api error = %+v", apiErr)
 	}
 }
@@ -82,8 +85,8 @@ func TestTableCreate(t *testing.T) {
 	}
 
 	err := c.Dataset("ds").Table("t").Create(ctx, md)
-	var apiErr *bigquery.APIError
-	if !errors.As(err, &apiErr) || apiErr.Code != http.StatusConflict || apiErr.Reason != "duplicate" {
+	var apiErr *googleapi.Error
+	if !errors.As(err, &apiErr) || apiErr.Code != http.StatusConflict || len(apiErr.Errors) == 0 || apiErr.Errors[0].Reason != "duplicate" {
 		t.Fatalf("err = %v, want 409 duplicate", err)
 	}
 	if bigquery.IsNotFound(err) {

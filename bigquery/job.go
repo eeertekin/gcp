@@ -122,6 +122,9 @@ type Job struct {
 	jobID      string
 	location   string
 	lastStatus *JobStatus
+
+	query bool
+	first *queryResponse
 }
 
 func (c *Client) insertJob(ctx context.Context, idc JobIDConfig, cfg jobConfiguration) (*Job, error) {
@@ -154,7 +157,7 @@ func (c *Client) insertJob(ctx context.Context, idc JobIDConfig, cfg jobConfigur
 		return nil, err
 	}
 
-	j := &Job{c: c, projectID: c.projectID, jobID: id, location: loc, lastStatus: statusFromResource(out.Status)}
+	j := &Job{c: c, projectID: c.projectID, jobID: id, location: loc, lastStatus: statusFromResource(out.Status, out.Statistics)}
 	if out.JobReference.ProjectID != "" {
 		j.projectID = out.JobReference.ProjectID
 	}
@@ -180,6 +183,9 @@ func (j *Job) LastStatus() *JobStatus {
 }
 
 func (j *Job) Status(ctx context.Context) (*JobStatus, error) {
+	if j.jobID == "" {
+		return j.lastStatus, nil
+	}
 	q := url.Values{}
 	if j.location != "" {
 		q.Set("location", j.location)
@@ -192,11 +198,14 @@ func (j *Job) Status(ctx context.Context) (*JobStatus, error) {
 	if j.location == "" {
 		j.location = out.JobReference.Location
 	}
-	j.lastStatus = statusFromResource(out.Status)
+	j.lastStatus = statusFromResource(out.Status, out.Statistics)
 	return j.lastStatus, nil
 }
 
 func (j *Job) Wait(ctx context.Context) (*JobStatus, error) {
+	if j.query {
+		return j.waitQuery(ctx)
+	}
 	delay := pollInitial
 	for j.lastStatus == nil || !j.lastStatus.Done() {
 		select {

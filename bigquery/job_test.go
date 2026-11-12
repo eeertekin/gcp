@@ -10,6 +10,7 @@ import (
 
 	"github.com/eeertekin/gcp/bigquery"
 	"github.com/eeertekin/gcp/bigquery/bigquerytest"
+	"github.com/eeertekin/gcp/googleapi"
 )
 
 func TestLoaderRun(t *testing.T) {
@@ -355,7 +356,7 @@ func TestRunDuplicateJobID(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := copier.Run(context.Background())
-	var apiErr *bigquery.APIError
+	var apiErr *googleapi.Error
 	if !errors.As(err, &apiErr) || apiErr.Code != http.StatusConflict {
 		t.Fatalf("err = %v, want 409", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -48,6 +49,11 @@ func TestNewClientCredentials(t *testing.T) {
 	c, err = NewClient(ctx, "other", withCreds, option.WithEndpoint("localhost:8085/"))
 	if err != nil || c.Project() != "other" || c.endpoint != "https://localhost:8085" {
 		t.Fatalf("explicit project / endpoint: %+v %v", c, err)
+	}
+
+	hc := &http.Client{}
+	if c, err = NewClient(ctx, "p", withCreds, option.WithHTTPClient(hc)); err != nil || c.http != hc || c.tokens.http != hc {
+		t.Fatalf("WithHTTPClient not used for API and token calls: %v", err)
 	}
 
 	if _, err := NewClient(ctx, "", withCreds); !errors.Is(err, ErrEmptyProjectID) {

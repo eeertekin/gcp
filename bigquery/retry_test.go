@@ -9,6 +9,7 @@ import (
 
 	"github.com/eeertekin/gcp/bigquery"
 	"github.com/eeertekin/gcp/bigquery/bigquerytest"
+	"github.com/eeertekin/gcp/googleapi"
 )
 
 func TestRetryTransientStatus(t *testing.T) {
@@ -45,8 +46,8 @@ func TestNoRetryOnPermanentErrors(t *testing.T) {
 		s.InjectFaults(f)
 
 		err := c.Dataset("ds").Table("t").Delete(context.Background())
-		var apiErr *bigquery.APIError
-		if !errors.As(err, &apiErr) || apiErr.Code != f.Status || apiErr.Reason != f.Reason {
+		var apiErr *googleapi.Error
+		if !errors.As(err, &apiErr) || apiErr.Code != f.Status || len(apiErr.Errors) == 0 || apiErr.Errors[0].Reason != f.Reason {
 			t.Errorf("%+v: err = %v", f, err)
 		}
 		if n := s.Attempts(); n != 1 {
@@ -64,7 +65,7 @@ func TestRetryGivesUp(t *testing.T) {
 	}
 
 	err := c.Dataset("ds").Table("t").Delete(context.Background())
-	var apiErr *bigquery.APIError
+	var apiErr *googleapi.Error
 	if !errors.As(err, &apiErr) || apiErr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("err = %v, want 503", err)
 	}
@@ -188,7 +189,7 @@ func TestInsertJobConflictNotMaskedWithoutPriorApply(t *testing.T) {
 	second := ds.Table("dst").CopierFrom(ds.Table("src"))
 	second.JobID = "dup"
 	_, err := second.Run(context.Background())
-	var apiErr *bigquery.APIError
+	var apiErr *googleapi.Error
 	if !errors.As(err, &apiErr) || apiErr.Code != http.StatusConflict {
 		t.Fatalf("err = %v, want 409 (a rate-limited attempt is never applied)", err)
 	}
@@ -215,7 +216,7 @@ func TestCreateTableConflictNotMaskedWithoutPriorApply(t *testing.T) {
 	s.InjectFaults(bigquerytest.Fault{Status: 429})
 
 	err := c.Dataset("ds").Table("t").Create(context.Background(), nil)
-	var apiErr *bigquery.APIError
+	var apiErr *googleapi.Error
 	if !errors.As(err, &apiErr) || apiErr.Code != http.StatusConflict {
 		t.Fatalf("err = %v, want 409", err)
 	}

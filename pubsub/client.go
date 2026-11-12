@@ -67,8 +67,11 @@ func NewClient(ctx context.Context, projectID string, opts ...option.ClientOptio
 		return nil, ErrEmptyProjectID
 	}
 
-	// Pulls are long polls, so deadlines are set per request instead of on the client.
-	hc := &http.Client{}
+	hc := s.HTTPClient
+	if hc == nil {
+		// Pulls are long polls, so deadlines are set per request instead of on the client.
+		hc = &http.Client{}
+	}
 	ts, err := newTokenSource(sa, hc)
 	if err != nil {
 		return nil, err

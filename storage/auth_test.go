@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -45,6 +46,11 @@ func TestNewClientCredentials(t *testing.T) {
 	c, err = NewClient(ctx, option.WithAuthCredentialsJSON(option.ServiceAccount, valid), option.WithEndpoint("http://localhost:1/"))
 	if err != nil || c.endpoint != "http://localhost:1" {
 		t.Fatalf("endpoint override: %+v %v", c, err)
+	}
+
+	hc := &http.Client{}
+	if c, err = NewClient(ctx, option.WithAuthCredentialsJSON(option.ServiceAccount, valid), option.WithHTTPClient(hc)); err != nil || c.http != hc || c.tokens.http != hc {
+		t.Fatalf("WithHTTPClient not used for API and token calls: %v", err)
 	}
 
 	c, err = NewClient(ctx, option.WithAuthCredentialsJSON(option.ServiceAccount, valid), option.WithEndpoint("storage.googleapis.com:443"))

@@ -11,10 +11,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
+	"github.com/eeertekin/gcp/googleapi"
 	"github.com/eeertekin/gcp/option"
 )
 
@@ -27,10 +27,11 @@ type Client struct {
 	Location string
 	Retry    RetryPolicy
 
-	projectID string
-	endpoint  string
-	http      *http.Client
-	tokens    *tokenSource
+	projectID    string
+	quotaProject string
+	endpoint     string
+	http         *http.Client
+	tokens       *tokenSource
 }
 
 func NewClient(ctx context.Context, projectID string, opts ...option.ClientOption) (*Client, error) {
@@ -39,37 +40,17 @@ func NewClient(ctx context.Context, projectID string, opts ...option.ClientOptio
 		o(&s)
 	}
 
-	creds := s.CredentialsJSON
-	if len(creds) == 0 && s.CredentialsFile != "" {
-		b, err := os.ReadFile(s.CredentialsFile)
-		if err != nil {
-			return nil, fmt.Errorf("bigquery: read credentials: %w", err)
-		}
-		creds = b
+	hc := s.HTTPClient
+	if hc == nil {
+		hc = &http.Client{Timeout: time.Minute}
 	}
-	if len(creds) == 0 {
-		return nil, errors.New("bigquery: credentials required: use option.WithAuthCredentialsJSON or option.WithAuthCredentialsFile")
-	}
-
-	var sa serviceAccount
-	if err := json.Unmarshal(creds, &sa); err != nil {
-		return nil, fmt.Errorf("bigquery: parse credentials: %w", err)
-	}
-	if s.CredentialsType != "" && string(s.CredentialsType) != sa.Type {
-		return nil, fmt.Errorf("bigquery: credentials type %q does not match %q", sa.Type, s.CredentialsType)
-	}
-	if sa.Type != string(option.ServiceAccount) {
-		return nil, fmt.Errorf("bigquery: unsupported credentials type %q", sa.Type)
-	}
-
-	hc := &http.Client{Timeout: time.Minute}
-	ts, err := newTokenSource(sa, hc)
+	creds, err := findCredentials(ctx, s, hc)
 	if err != nil {
 		return nil, err
 	}
 
 	if projectID == "" || projectID == DetectProjectID {
-		projectID = sa.ProjectID
+		projectID = creds.projectID
 	}
 	if projectID == "" {
 		return nil, errors.New("bigquery: project id is required")
@@ -78,14 +59,17 @@ func NewClient(ctx context.Context, projectID string, opts ...option.ClientOptio
 	endpoint := strings.TrimSuffix(s.Endpoint, "/")
 	if endpoint == "" {
 		endpoint = defaultEndpoint
+	} else if !strings.Contains(endpoint, "://") {
+		endpoint = "https://" + endpoint
 	}
 
 	return &Client{
-		Retry:     defaultRetryPolicy(),
-		projectID: projectID,
-		endpoint:  endpoint,
-		http:      hc,
-		tokens:    ts,
+		Retry:        defaultRetryPolicy(),
+		projectID:    projectID,
+		quotaProject: creds.quotaProject,
+		endpoint:     endpoint,
+		http:         hc,
+		tokens:       creds.tokens,
 	}, nil
 }
 
@@ -98,20 +82,27 @@ func (c *Client) Close() error {
 	return nil
 }
 
-type APIError struct {
-	Code    int
-	Status  string
-	Reason  string
-	Message string
-}
-
-func (e *APIError) Error() string {
-	return fmt.Sprintf("bigquery: Error %d: %s, %s", e.Code, e.Message, e.Reason)
-}
-
 func IsNotFound(err error) bool {
-	var e *APIError
+	var e *googleapi.Error
 	return errors.As(err, &e) && e.Code == http.StatusNotFound
+}
+
+func reason(e *googleapi.Error) string {
+	if len(e.Errors) > 0 {
+		return e.Errors[0].Reason
+	}
+	return ""
+}
+
+func (c *Client) path(project string, parts ...string) string {
+	if project == "" {
+		project = c.projectID
+	}
+	p := "/projects/" + url.PathEscape(project)
+	for _, part := range parts {
+		p += "/" + url.PathEscape(part)
+	}
+	return p
 }
 
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, in, out any) error {
@@ -139,7 +130,9 @@ func (c *Client) send(ctx context.Context, method, path string, query url.Values
 		data, err := c.attempt(ctx, method, u, payload)
 		if err == nil {
 			if out != nil && len(data) > 0 {
-				return maybeApplied, json.Unmarshal(data, out)
+				if err := json.Unmarshal(data, out); err != nil {
+					return maybeApplied, fmt.Errorf("bigquery: decode response: %w", err)
+				}
 			}
 			return maybeApplied, nil
 		}
@@ -175,6 +168,9 @@ func (c *Client) attempt(ctx context.Context, method, u string, payload []byte) 
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	if c.quotaProject != "" {
+		req.Header.Set("X-Goog-User-Project", c.quotaProject)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -187,28 +183,27 @@ func (c *Client) attempt(ctx context.Context, method, u string, payload []byte) 
 		return nil, &transportError{err: err}
 	}
 	if resp.StatusCode >= 300 {
-		return nil, parseAPIError(resp.StatusCode, data)
+		return nil, parseAPIError(resp.StatusCode, resp.Header, data)
 	}
 	return data, nil
 }
 
-func parseAPIError(code int, data []byte) error {
-	e := &APIError{Code: code, Message: strings.TrimSpace(string(data))}
+func parseAPIError(code int, header http.Header, data []byte) error {
+	e := &googleapi.Error{Code: code, Body: string(data), Header: header}
 	var env struct {
 		Error struct {
-			Message string `json:"message"`
-			Status  string `json:"status"`
-			Errors  []struct {
-				Reason string `json:"reason"`
-			} `json:"errors"`
+			Message string                `json:"message"`
+			Errors  []googleapi.ErrorItem `json:"errors"`
 		} `json:"error"`
 	}
 	if json.Unmarshal(data, &env) == nil && env.Error.Message != "" {
 		e.Message = env.Error.Message
-		e.Status = env.Error.Status
-		if len(env.Error.Errors) > 0 {
-			e.Reason = env.Error.Errors[0].Reason
-		}
+		e.Errors = env.Error.Errors
+		return e
+	}
+	e.Message = strings.TrimSpace(string(data))
+	if e.Message == "" {
+		e.Message = http.StatusText(code)
 	}
 	return e
 }
@@ -217,4 +212,13 @@ func randomID() string {
 	b := make([]byte, 12)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func newRequestID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	h := hex.EncodeToString(b)
+	return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
 }

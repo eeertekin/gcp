@@ -6,30 +6,35 @@ The public API mirrors the official packages (`cloud.google.com/go/bigquery`, `c
 
 ## Results
 
-Same program using all three services (BigQuery create/load/copy/delete, Storage upload/signed URL/delete, Pub/Sub publish/receive), built for `linux/amd64`:
+Same program using all three services (BigQuery dataset metadata/create/load/copy/query/read rows/list datasets and tables/delete, Storage upload/signed URL/delete, Pub/Sub publish/receive), built with Go 1.27 for `linux/amd64` (`-trimpath`, `CGO_ENABLED=0`). Only the import paths differ between the two builds:
 
 | | Official SDKs | stdlib | Difference |
 |---|---|---|---|
-| Stripped binary (`-s -w`) | 39.04 MB | **6.85 MB** | 5.7× smaller |
-| Default binary | 57.01 MB | **10.04 MB** | 5.7× smaller |
-| Modules | 254 | **1** | |
-| Non-standard packages | 529 | **5** | |
-| Cold build | 18 s | **5 s** | 3.6× faster |
+| Stripped binary (`-s -w`) | 39.25 MB | **6.93 MB** | 5.7× smaller |
+| Default binary | 57.34 MB | **10.16 MB** | 5.6× smaller |
+| Modules (`go list -m all`) | 164 | **1** | |
+| Modules linked | 59 | **1** | |
+| Non-standard packages | 534 | **7** | |
+| Cold build | 11.7 s | **3.2 s** | 3.7× faster |
 
 Per service (stripped / default binary):
 
 | Service | Official SDK | stdlib |
 |---|---|---|
-| Storage only | 32.12 MB / 46.95 MB | 6.68 MB / 9.81 MB |
-| Pub/Sub only | 17.15 MB / 25.07 MB | 6.71 MB / 9.84 MB |
-| All three | 39.04 MB / 57.01 MB | 6.85 MB / 10.04 MB |
+| Storage only | 32.27 MB / 47.23 MB | 6.70 MB / 9.83 MB |
+| Pub/Sub only | 16.81 MB / 24.62 MB | 6.70 MB / 9.83 MB |
+| BigQuery only | 22.13 MB / 32.39 MB | 6.76 MB / 9.91 MB |
+| All three | 39.25 MB / 57.34 MB | 6.93 MB / 10.16 MB |
 
 The SDKs grow with every service because each brings its own heavy dependencies (gRPC, protobuf, OpenTelemetry, Apache Arrow, …). The stdlib packages share `net/http` and `crypto`, so adding a service costs only its own logic (~0.1 MB).
 
 ## Layout
 
 ```
-option/            shared client options (credentials, endpoint)
+option/            shared client options (credentials, endpoint, HTTP client)
+civil/             DATE / TIME / DATETIME values (mirrors cloud.google.com/go/civil)
+googleapi/         HTTP error type (mirrors google.golang.org/api/googleapi)
+iterator/          iterator.Done (mirrors google.golang.org/api/iterator)
 bigquery/          BigQuery REST client
 └── bigquerytest/  in-process fake server for tests
 storage/           Cloud Storage JSON API client + V4 signed URLs
@@ -38,18 +43,22 @@ pubsub/            Pub/Sub REST client (publish + subscribe)
 └── pubsubtest/    in-process fake server for tests
 ```
 
-Each service package is self-contained (its own auth and retry code), so you can copy a single folder into another project together with `option`.
+Each service package is self-contained (its own auth and retry code), so you can copy a single folder into another project together with `option` (BigQuery also needs `civil`, `googleapi` and `iterator`).
 
 ## Authentication
 
-All clients use a **service account** key. A JWT is signed with RS256 and exchanged for an OAuth2 access token, which is cached and refreshed one minute before expiry.
+Storage and Pub/Sub use a **service account** key. A JWT is signed with RS256 and exchanged for an OAuth2 access token, which is cached and refreshed one minute before expiry.
+
+BigQuery additionally supports **Application Default Credentials** when no credentials option is given: `GOOGLE_APPLICATION_CREDENTIALS`, then the gcloud file from `gcloud auth application-default login` (service account or user credentials), then the GCE / Cloud Run / GKE metadata server.
 
 ```go
 import "github.com/eeertekin/gcp/option"
 
 option.WithAuthCredentialsJSON(option.ServiceAccount, jsonBytes)
 option.WithAuthCredentialsFile(option.ServiceAccount, "/path/to/key.json")
-option.WithEndpoint("https://custom-endpoint")   // emulators, fakes, private endpoints
+option.WithAuthCredentialsJSON(option.AuthorizedUser, userJSON) // BigQuery only
+option.WithEndpoint("https://custom-endpoint")                  // emulators, fakes, private endpoints
+option.WithHTTPClient(httpClient)                               // custom transport; auth is still added
 ```
 
 ## Cloud Storage — `github.com/eeertekin/gcp/storage`
@@ -96,9 +105,27 @@ status, err := job.Wait(ctx)
 
 job, err = ds.Table("demo_copy").CopierFrom(ds.Table("demo")).Run(ctx)
 err = ds.Table("demo").Delete(ctx) // bigquery.IsNotFound(err) on 404
+
+q := client.Query("SELECT id, name FROM demo")
+q.DefaultDatasetID = "demo"
+job, err = q.Run(ctx)
+status, err = job.Wait(ctx)
+it, err := job.Read(ctx)
+for {
+	var row []bigquery.Value
+	err := it.Next(&row)
+	if errors.Is(err, iterator.Done) {
+		break
+	}
+	// row[0] is int64, row[1] is string; it.Schema describes the columns
+}
 ```
 
-- Tables: `Create`, `Delete`.
+- Queries: `Query.Run` uses `jobs.query`, so a short query costs one round trip; longer ones long-poll `getQueryResults` and pages are prefetched. Retries reuse the `requestId`, so a query never runs twice. `Job.Cancel`, and DML counts via `QueryStatistics.NumDMLAffectedRows`.
+- Values decode like the official client: `int64`, `float64`, `bool`, `string`, `[]byte`, `*big.Rat` (NUMERIC/BIGNUMERIC), `civil.Date`/`Time`/`DateTime`, UTC `time.Time`, `*IntervalValue`, `*RangeValue`, and `[]bigquery.Value` for arrays and structs.
+- Catalog: `Datasets`, `Dataset.Metadata`, `Dataset.Tables`.
+- Errors: HTTP failures are `*googleapi.Error` (`Code`, `Message`, `Errors[].Reason`).
+- Tables: `Create`, `Metadata`, `Delete`.
 - Jobs: load from GCS (`LoaderFrom`), table copy (`CopierFrom`), `Status`, `Wait` (polling with backoff), job ID / location control via `JobIDConfig`.
 - Job inserts are safe to retry: if a retried insert hits "already exists", the client attaches to the existing job instead of failing.
 
@@ -154,7 +181,7 @@ srv.CreateSubscription("s", "t", pubsubtest.SubscriptionConfig{})
 
 | Package | Tests |
 |---|---|
-| `bigquery` | 34 |
+| `bigquery` | 59 (incl. paging, deadline-bounded polling, cancel, idempotent retry, ADC) |
 | `storage` | 50 (incl. Google's V4 signing conformance suite) |
 | `pubsub` | 42 (incl. a 600-message end-to-end publish → receive) |
 
@@ -162,4 +189,4 @@ srv.CreateSubscription("s", "t", pubsubtest.SubscriptionConfig{})
 go test -race -timeout 15s ./...
 ```
 
-The suites were mutation-checked: deliberately breaking core behaviors (resumable upload probing, signed content type, lease extension, flow control, ordered publishing, nack-on-shutdown) makes the corresponding tests fail.
+The suites were mutation-checked: deliberately breaking core behaviors (resumable upload probing, signed content type, lease extension, flow control, ordered publishing, nack-on-shutdown, deadline-bounded query polling) makes the corresponding tests fail.

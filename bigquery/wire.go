@@ -8,12 +8,25 @@ type tableReference struct {
 	TableID   string `json:"tableId"`
 }
 
+type datasetReference struct {
+	ProjectID string `json:"projectId"`
+	DatasetID string `json:"datasetId"`
+}
+
+type wireRangeElementType struct {
+	Type FieldType `json:"type"`
+}
+
 type wireField struct {
-	Name        string      `json:"name"`
-	Type        FieldType   `json:"type"`
-	Mode        string      `json:"mode,omitempty"`
-	Description string      `json:"description,omitempty"`
-	Fields      []wireField `json:"fields,omitempty"`
+	Name             string                `json:"name"`
+	Type             FieldType             `json:"type"`
+	Mode             string                `json:"mode,omitempty"`
+	Description      string                `json:"description,omitempty"`
+	Fields           []wireField           `json:"fields,omitempty"`
+	MaxLength        int64                 `json:"maxLength,string,omitempty"`
+	Precision        int64                 `json:"precision,string,omitempty"`
+	Scale            int64                 `json:"scale,string,omitempty"`
+	RangeElementType *wireRangeElementType `json:"rangeElementType,omitempty"`
 }
 
 type wireSchema struct {
@@ -32,6 +45,14 @@ type tableResource struct {
 	Description      string                `json:"description,omitempty"`
 	Schema           *wireSchema           `json:"schema,omitempty"`
 	TimePartitioning *wireTimePartitioning `json:"timePartitioning,omitempty"`
+}
+
+type datasetResource struct {
+	ID           string            `json:"id"`
+	FriendlyName string            `json:"friendlyName"`
+	Description  string            `json:"description"`
+	Location     string            `json:"location"`
+	Labels       map[string]string `json:"labels"`
 }
 
 type jobReference struct {
@@ -78,10 +99,41 @@ type jobStatusResource struct {
 	Errors      []errorProto `json:"errors,omitempty"`
 }
 
+type jobStatisticsResource struct {
+	Query *struct {
+		NumDMLAffectedRows int64 `json:"numDmlAffectedRows,string"`
+	} `json:"query,omitempty"`
+}
+
 type jobResource struct {
-	JobReference  jobReference       `json:"jobReference"`
-	Configuration jobConfiguration   `json:"configuration"`
-	Status        *jobStatusResource `json:"status,omitempty"`
+	JobReference  jobReference           `json:"jobReference"`
+	Configuration jobConfiguration       `json:"configuration"`
+	Status        *jobStatusResource     `json:"status,omitempty"`
+	Statistics    *jobStatisticsResource `json:"statistics,omitempty"`
+}
+
+type dataFormatOptions struct {
+	UseInt64Timestamp bool `json:"useInt64Timestamp"`
+}
+
+type queryRequest struct {
+	Query           string             `json:"query"`
+	UseLegacySQL    bool               `json:"useLegacySql"`
+	DefaultDataset  *datasetReference  `json:"defaultDataset,omitempty"`
+	Location        string             `json:"location,omitempty"`
+	RequestID       string             `json:"requestId"`
+	JobCreationMode string             `json:"jobCreationMode"`
+	TimeoutMs       int64              `json:"timeoutMs,omitempty"`
+	FormatOptions   *dataFormatOptions `json:"formatOptions"`
+}
+
+type queryResponse struct {
+	JobReference       jobReference `json:"jobReference"`
+	JobComplete        bool         `json:"jobComplete"`
+	Schema             *wireSchema  `json:"schema"`
+	Rows               []wireRow    `json:"rows"`
+	PageToken          string       `json:"pageToken"`
+	NumDMLAffectedRows int64        `json:"numDmlAffectedRows,string"`
 }
 
 func (s Schema) toWire() []wireField {
@@ -92,6 +144,12 @@ func (s Schema) toWire() []wireField {
 			Type:        f.Type,
 			Description: f.Description,
 			Fields:      f.Schema.toWire(),
+			MaxLength:   f.MaxLength,
+			Precision:   f.Precision,
+			Scale:       f.Scale,
+		}
+		if f.RangeElementType != nil {
+			wf.RangeElementType = &wireRangeElementType{Type: f.RangeElementType.Type}
 		}
 		switch {
 		case f.Repeated:
@@ -110,14 +168,21 @@ func schemaFromWire(fs []wireField) Schema {
 	}
 	out := make(Schema, 0, len(fs))
 	for _, f := range fs {
-		out = append(out, &FieldSchema{
+		fs := &FieldSchema{
 			Name:        f.Name,
 			Description: f.Description,
 			Type:        f.Type,
 			Repeated:    f.Mode == "REPEATED",
 			Required:    f.Mode == "REQUIRED",
 			Schema:      schemaFromWire(f.Fields),
-		})
+			MaxLength:   f.MaxLength,
+			Precision:   f.Precision,
+			Scale:       f.Scale,
+		}
+		if f.RangeElementType != nil {
+			fs.RangeElementType = &RangeElementType{Type: f.RangeElementType.Type}
+		}
+		out = append(out, fs)
 	}
 	return out
 }
@@ -150,8 +215,11 @@ func timePartitioningFromWire(w *wireTimePartitioning) *TimePartitioning {
 	}
 }
 
-func statusFromResource(r *jobStatusResource) *JobStatus {
+func statusFromResource(r *jobStatusResource, stats *jobStatisticsResource) *JobStatus {
 	s := &JobStatus{}
+	if stats != nil && stats.Query != nil {
+		s.Statistics = &JobStatistics{Details: &QueryStatistics{NumDMLAffectedRows: stats.Query.NumDMLAffectedRows}}
+	}
 	if r == nil {
 		return s
 	}

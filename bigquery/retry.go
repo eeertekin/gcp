@@ -6,6 +6,8 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"time"
+
+	"github.com/eeertekin/gcp/googleapi"
 )
 
 type RetryPolicy struct {
@@ -30,22 +32,23 @@ func (e *transportError) Unwrap() error { return e.err }
 func retryable(err error) (retry, maybeApplied bool) {
 	var tErr *transportError
 	var tokErr *tokenError
-	var apiErr *APIError
+	var apiErr *googleapi.Error
 	switch {
 	case errors.As(err, &tErr):
 		return true, true
 	case errors.As(err, &tokErr):
 		return tokErr.code == 0 || tokErr.code == http.StatusTooManyRequests || tokErr.code >= 500, false
 	case errors.As(err, &apiErr):
+		r := reason(apiErr)
 		switch {
-		case apiErr.Code == http.StatusTooManyRequests, apiErr.Reason == "rateLimitExceeded":
+		case apiErr.Code == http.StatusTooManyRequests, r == "rateLimitExceeded":
 			return true, false
 		case apiErr.Code == http.StatusInternalServerError,
 			apiErr.Code == http.StatusBadGateway,
 			apiErr.Code == http.StatusServiceUnavailable,
 			apiErr.Code == http.StatusGatewayTimeout,
-			apiErr.Reason == "backendError",
-			apiErr.Reason == "internalError":
+			r == "backendError",
+			r == "internalError":
 			return true, true
 		}
 	}
@@ -82,6 +85,6 @@ func sleep(ctx context.Context, d time.Duration) error {
 }
 
 func isConflict(err error) bool {
-	var e *APIError
+	var e *googleapi.Error
 	return errors.As(err, &e) && e.Code == http.StatusConflict
 }

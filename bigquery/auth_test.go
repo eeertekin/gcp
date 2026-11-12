@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -53,6 +54,16 @@ func TestNewClientCredentials(t *testing.T) {
 		t.Fatalf("project override / endpoint: %+v %v", c, err)
 	}
 
+	c, err = NewClient(ctx, "p", option.WithAuthCredentialsJSON(option.ServiceAccount, valid), option.WithEndpoint("bigquery.googleapis.com/bigquery/v2"))
+	if err != nil || c.endpoint != "https://bigquery.googleapis.com/bigquery/v2" {
+		t.Fatalf("endpoint without scheme: %+v %v", c, err)
+	}
+
+	hc := &http.Client{}
+	if c, err = NewClient(ctx, "p", option.WithAuthCredentialsJSON(option.ServiceAccount, valid), option.WithHTTPClient(hc)); err != nil || c.http != hc || c.tokens.http != hc {
+		t.Fatalf("WithHTTPClient not used for API and token calls: %v", err)
+	}
+
 	path := filepath.Join(t.TempDir(), "sa.json")
 	if err := os.WriteFile(path, valid, 0o600); err != nil {
 		t.Fatal(err)
@@ -61,13 +72,19 @@ func TestNewClientCredentials(t *testing.T) {
 		t.Fatalf("credentials file: %s", err)
 	}
 
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+	t.Setenv("CLOUDSDK_CONFIG", t.TempDir())
+	t.Setenv("GCE_METADATA_HOST", "127.0.0.1:1")
+
 	bad := map[string][]option.ClientOption{
 		"no credentials":   nil,
 		"missing file":     {option.WithAuthCredentialsFile(option.ServiceAccount, filepath.Join(t.TempDir(), "nope.json"))},
-		"type mismatch":    {option.WithAuthCredentialsJSON("authorized_user", valid)},
+		"type mismatch":    {option.WithAuthCredentialsJSON(option.AuthorizedUser, valid)},
 		"invalid json":     {option.WithAuthCredentialsJSON(option.ServiceAccount, []byte("{"))},
-		"unsupported type": {option.WithAuthCredentialsJSON("", creds(func(m map[string]string) { m["type"] = "authorized_user" }))},
-		"bad pem":          {option.WithAuthCredentialsJSON(option.ServiceAccount, creds(func(m map[string]string) { m["private_key"] = "not a key" }))},
+		"unsupported type": {option.WithAuthCredentialsJSON("", creds(func(m map[string]string) { m["type"] = "external_account" }))},
+		"user without refresh token": {option.WithAuthCredentialsJSON(option.AuthorizedUser, []byte(
+			`{"type":"authorized_user","client_id":"id","client_secret":"secret","quota_project_id":"p1"}`))},
+		"bad pem": {option.WithAuthCredentialsJSON(option.ServiceAccount, creds(func(m map[string]string) { m["private_key"] = "not a key" }))},
 		"bad der": {option.WithAuthCredentialsJSON(option.ServiceAccount, creds(func(m map[string]string) {
 			m["private_key"] = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"
 		}))},

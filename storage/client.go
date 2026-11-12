@@ -56,10 +56,13 @@ func NewClient(ctx context.Context, opts ...option.ClientOption) (*Client, error
 		return nil, fmt.Errorf("storage: unsupported credentials type %q", sa.Type)
 	}
 
-	// No overall client timeout: large chunk uploads may legitimately take long.
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.ResponseHeaderTimeout = time.Minute
-	hc := &http.Client{Transport: tr}
+	hc := s.HTTPClient
+	if hc == nil {
+		// No overall client timeout: large chunk uploads may legitimately take long.
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.ResponseHeaderTimeout = time.Minute
+		hc = &http.Client{Transport: tr}
+	}
 
 	ts, err := newTokenSource(sa, hc)
 	if err != nil {

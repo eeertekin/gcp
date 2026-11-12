@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -23,11 +25,41 @@ import (
 )
 
 const (
-	ProjectID   = "test-project"
-	ClientEmail = "sa@test-project.iam.gserviceaccount.com"
-	KeyID       = "kid-1"
-	Location    = "US"
+	ProjectID        = "test-project"
+	ClientEmail      = "sa@test-project.iam.gserviceaccount.com"
+	KeyID            = "kid-1"
+	Location         = "US"
+	UserClientID     = "user-client-id"
+	UserClientSecret = "user-client-secret"
+	UserRefreshToken = "user-refresh-token"
 )
+
+// QueryResult scripts the response to one SQL string. Rows hold cells the way
+// the REST API sends them: scalars as strings, nil for NULL, []any for a
+// REPEATED or RECORD value.
+type QueryResult struct {
+	Schema      bigquery.Schema
+	Rows        [][]any
+	PageSize    int
+	Polls       int
+	DMLAffected int64
+	ErrStatus   int
+	ErrReason   string
+	ErrMessage  string
+}
+
+type ResultRequest struct {
+	JobID string
+	Query url.Values
+}
+
+type queryJob struct {
+	id        string
+	location  string
+	res       *QueryResult
+	pollsLeft int
+	cancelled bool
+}
 
 type JobInfo struct {
 	ID          string
@@ -64,13 +96,28 @@ type Server struct {
 	attempts    int
 	faults      []Fault
 	tokenFaults []int
+
+	datasets       map[string]bool
+	listPageSize   int
+	queries        map[string]*QueryResult
+	queryJobs      map[string]*queryJob
+	byRequestID    map[string]*queryJob
+	jobSeq         int
+	queryRequests  []map[string]any
+	resultRequests []ResultRequest
+	cancelled      []string
+	pollDelay      time.Duration
+	quotaProject   string
 }
 
+// Fault replaces the response to the next API request whose "METHOD
+// /path?query" contains Match (any request when Match is empty).
 type Fault struct {
 	Status     int
 	Reason     string
 	AfterApply bool
 	Drop       bool
+	Match      string
 }
 
 func NewServer(t testing.TB) (*Server, *bigquery.Client) {
@@ -87,10 +134,23 @@ func NewServer(t testing.TB) (*Server, *bigquery.Client) {
 		tokenTTL: 3600,
 		tables:   map[string]map[string]any{},
 		jobs:     map[string]*job{},
+
+		datasets:    map[string]bool{},
+		queries:     map[string]*QueryResult{},
+		queryJobs:   map[string]*queryJob{},
+		byRequestID: map[string]*queryJob{},
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /token", s.handleToken)
+	mux.HandleFunc("GET /computeMetadata/v1/project/project-id", s.handleMetadataProject)
+	mux.HandleFunc("GET /computeMetadata/v1/instance/service-accounts/default/token", s.handleMetadataToken)
+	mux.HandleFunc("GET /projects/{p}/datasets", s.api(s.handleListDatasets))
+	mux.HandleFunc("GET /projects/{p}/datasets/{d}", s.api(s.handleGetDataset))
+	mux.HandleFunc("GET /projects/{p}/datasets/{d}/tables", s.api(s.handleListTables))
+	mux.HandleFunc("POST /projects/{p}/queries", s.api(s.handleQuery))
+	mux.HandleFunc("GET /projects/{p}/queries/{j}", s.api(s.handleQueryResults))
+	mux.HandleFunc("POST /projects/{p}/jobs/{j}/cancel", s.api(s.handleCancelJob))
 	mux.HandleFunc("GET /projects/{p}/datasets/{d}/tables/{t}", s.api(s.handleGetTable))
 	mux.HandleFunc("DELETE /projects/{p}/datasets/{d}/tables/{t}", s.api(s.handleDeleteTable))
 	mux.HandleFunc("POST /projects/{p}/datasets/{d}/tables", s.api(s.handleCreateTable))
@@ -133,10 +193,13 @@ func (s *Server) api(h http.HandlerFunc) http.HandlerFunc {
 		s.mu.Lock()
 		s.attempts++
 		var f *Fault
-		if len(s.faults) > 0 {
-			next := s.faults[0]
-			s.faults = s.faults[1:]
-			f = &next
+		target := r.Method + " " + r.URL.RequestURI()
+		for i, next := range s.faults {
+			if next.Match == "" || strings.Contains(target, next.Match) {
+				s.faults = append(s.faults[:i:i], s.faults[i+1:]...)
+				f = &next
+				break
+			}
 		}
 		s.mu.Unlock()
 
@@ -185,16 +248,102 @@ func (s *Server) credentials(key *rsa.PrivateKey) []byte {
 	return b
 }
 
+func (s *Server) URL() string {
+	return s.srv.URL
+}
+
+// Host is the host:port to use as GCE_METADATA_HOST.
+func (s *Server) Host() string {
+	return strings.TrimPrefix(s.srv.URL, "http://")
+}
+
+func (s *Server) ServiceAccountJSON() []byte {
+	return s.creds
+}
+
+func (s *Server) AuthorizedUserJSON() []byte {
+	b, _ := json.Marshal(map[string]string{
+		"type":             "authorized_user",
+		"client_id":        UserClientID,
+		"client_secret":    UserClientSecret,
+		"refresh_token":    UserRefreshToken,
+		"quota_project_id": ProjectID,
+		"token_uri":        s.srv.URL + "/token",
+	})
+	return b
+}
+
+func (s *Server) QuotaProject() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.quotaProject
+}
+
+func (s *Server) AddDataset(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.datasets[name] = true
+}
+
 func (s *Server) AddTable(dataset, table string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.datasets[dataset] = true
 	s.tables[dataset+"/"+table] = map[string]any{}
 }
 
 func (s *Server) SetTable(dataset, table string, raw map[string]any) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.datasets[dataset] = true
 	s.tables[dataset+"/"+table] = raw
+}
+
+// SetListPageSize makes dataset and table listings return n items per page.
+func (s *Server) SetListPageSize(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listPageSize = n
+}
+
+func (s *Server) SetQuery(sql string, res *QueryResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queries[sql] = res
+}
+
+// SetPollDelay holds each incomplete getQueryResults poll for d, or for the
+// request's timeoutMs if that is shorter, the way the real long poll does.
+func (s *Server) SetPollDelay(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pollDelay = d
+}
+
+func (s *Server) QueryRequests() []map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]map[string]any(nil), s.queryRequests...)
+}
+
+func (s *Server) ResultRequests() []ResultRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]ResultRequest(nil), s.resultRequests...)
+}
+
+func (s *Server) Cancelled() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.cancelled...)
+}
+
+// QueryRuns counts queries executed, deduplicated by requestId the way
+// BigQuery deduplicates retried jobs.query calls.
+func (s *Server) QueryRuns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.byRequestID)
 }
 
 func (s *Server) HasTable(dataset, table string) bool {
@@ -297,21 +446,59 @@ func (s *Server) handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
-	if gt := r.PostForm.Get("grant_type"); gt != "urn:ietf:params:oauth:grant-type:jwt-bearer" {
+	switch gt := r.PostForm.Get("grant_type"); gt {
+	case "urn:ietf:params:oauth:grant-type:jwt-bearer":
+		if err := s.verifyJWT(r.PostForm.Get("assertion")); err != nil {
+			s.t.Errorf("bigquerytest: token: %s", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	case "refresh_token":
+		f := r.PostForm
+		if f.Get("client_id") != UserClientID || f.Get("client_secret") != UserClientSecret || f.Get("refresh_token") != UserRefreshToken {
+			s.t.Errorf("bigquerytest: token: bad refresh_token grant %v", f)
+			http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+			return
+		}
+	default:
 		s.t.Errorf("bigquerytest: token: grant_type = %q", gt)
-	}
-	if err := s.verifyJWT(r.PostForm.Get("assertion")); err != nil {
-		s.t.Errorf("bigquerytest: token: %s", err)
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, `{"error":"unsupported_grant_type"}`, http.StatusBadRequest)
 		return
 	}
+	s.issueToken(w)
+}
 
+func (s *Server) issueToken(w http.ResponseWriter) {
 	s.lastToken = fmt.Sprintf("tok-%d", s.tokenCalls)
 	json.NewEncoder(w).Encode(map[string]any{
 		"access_token": s.lastToken,
 		"expires_in":   s.tokenTTL,
 		"token_type":   "Bearer",
 	})
+}
+
+func (s *Server) handleMetadataProject(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Metadata-Flavor") != "Google" {
+		s.t.Errorf("bigquerytest: metadata project-id without Metadata-Flavor header")
+		http.Error(w, "missing Metadata-Flavor", http.StatusForbidden)
+		return
+	}
+	io.WriteString(w, ProjectID)
+}
+
+func (s *Server) handleMetadataToken(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tokenCalls++
+	if r.Header.Get("Metadata-Flavor") != "Google" {
+		s.t.Errorf("bigquerytest: metadata token without Metadata-Flavor header")
+		http.Error(w, "missing Metadata-Flavor", http.StatusForbidden)
+		return
+	}
+	if !strings.Contains(r.URL.Query().Get("scopes"), "https://www.googleapis.com/auth/bigquery") {
+		s.t.Errorf("bigquerytest: metadata token scopes = %q", r.URL.Query().Get("scopes"))
+	}
+	s.issueToken(w)
 }
 
 func (s *Server) verifyJWT(assertion string) error {
@@ -372,6 +559,7 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
 	if r.PathValue("p") != ProjectID {
 		s.t.Errorf("bigquerytest: %s %s: project = %q", r.Method, r.URL.Path, r.PathValue("p"))
 	}
+	s.quotaProject = r.Header.Get("X-Goog-User-Project")
 	got := r.Header.Get("Authorization")
 	if s.lastToken == "" || got != "Bearer "+s.lastToken {
 		writeAPIError(w, http.StatusUnauthorized, "UNAUTHENTICATED", "authError", "bad token "+got)

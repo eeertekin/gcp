@@ -52,12 +52,20 @@ const (
 )
 
 type FieldSchema struct {
-	Name        string
-	Description string
-	Repeated    bool
-	Required    bool
-	Type        FieldType
-	Schema      Schema
+	Name             string
+	Description      string
+	Repeated         bool
+	Required         bool
+	Type             FieldType
+	Schema           Schema
+	MaxLength        int64
+	Precision        int64
+	Scale            int64
+	RangeElementType *RangeElementType
+}
+
+type RangeElementType struct {
+	Type FieldType
 }
 
 type Schema []*FieldSchema
@@ -94,11 +102,26 @@ const (
 )
 
 type JobStatus struct {
-	State  State
-	Errors []*Error
+	State      State
+	Errors     []*Error
+	Statistics *JobStatistics
 
 	err error
 }
+
+type JobStatistics struct {
+	Details Statistics
+}
+
+type Statistics interface {
+	implementsStatistics()
+}
+
+type QueryStatistics struct {
+	NumDMLAffectedRows int64
+}
+
+func (*QueryStatistics) implementsStatistics() {}
 
 func (s *JobStatus) Done() bool {
 	return s.State == Done
