@@ -2,6 +2,7 @@ package storage_test
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"io"
@@ -231,5 +232,29 @@ func TestJSONCopy(t *testing.T) {
 	}
 	if n := strings.Count(strings.Join(s.Calls(), "\n"), "REWRITE "+storagetest.Bucket+"/src "+storagetest.Bucket+"/dst step-1"); n != 1 {
 		t.Fatalf("rewrite continuation calls = %d\n%q", n, s.Calls())
+	}
+}
+
+func TestJSONContentEncodingTranscoded(t *testing.T) {
+	s, b := jsonSetup(t)
+	var gz bytes.Buffer
+	zw := gzip.NewWriter(&gz)
+	zw.Write([]byte("sqlite bytes"))
+	zw.Close()
+	w := b.Object("snap").NewWriter(context.Background())
+	w.ContentType = "application/x-sqlite3"
+	w.ContentEncoding = "gzip"
+	w.Write(gz.Bytes())
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if o, _ := s.Object(storagetest.Bucket, "snap"); o.ContentEncoding != "gzip" || !bytes.Equal(o.Data, gz.Bytes()) {
+		t.Fatalf("stored encoding %q, %d bytes", o.ContentEncoding, len(o.Data))
+	}
+	if a, err := b.Object("snap").Attrs(context.Background()); err != nil || a.ContentEncoding != "gzip" {
+		t.Fatalf("attrs = %+v, %v", a, err)
+	}
+	if got := readAll(t, b.Object("snap"), 0, -1); got != "sqlite bytes" {
+		t.Fatalf("read = %q", got)
 	}
 }

@@ -43,12 +43,13 @@ const (
 )
 
 type Object struct {
-	Data        []byte
-	ContentType string
-	Generation  int64
-	Metadata    map[string]string
-	Created     time.Time
-	Finalized   time.Time
+	Data            []byte
+	ContentType     string
+	ContentEncoding string
+	Generation      int64
+	Metadata        map[string]string
+	Created         time.Time
+	Finalized       time.Time
 
 	epoch    uint64
 	statSize int64
@@ -58,7 +59,7 @@ type session struct {
 	bucket      string
 	name        string
 	contentType string
-	metadata    map[string]string
+	meta        objectMeta
 	ifGen       string
 	data        []byte
 	done        *Object
@@ -519,6 +520,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 		s.calls = append(s.calls, "MULTIPART "+bucket+"/"+name)
 		obj := s.store(bucket, name, meta.ContentType, meta.Metadata, data)
+		obj.ContentEncoding = meta.ContentEncoding
 		s.writeObject(w, bucket, name, obj)
 	case "resumable":
 		var meta objectMeta
@@ -529,7 +531,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		id := randomID()
-		s.sessions[id] = &session{bucket: bucket, name: name, contentType: r.Header.Get("X-Upload-Content-Type"), metadata: meta.Metadata, ifGen: q.Get("ifGenerationMatch")}
+		s.sessions[id] = &session{bucket: bucket, name: name, contentType: r.Header.Get("X-Upload-Content-Type"), meta: meta, ifGen: q.Get("ifGenerationMatch")}
 		s.calls = append(s.calls, "SESSION "+bucket+"/"+name)
 		q := url.Values{"uploadType": {"resumable"}, "name": {name}, "upload_id": {id}}
 		w.Header().Set("Location", s.srv.URL+"/upload/storage/v1/b/"+url.PathEscape(bucket)+"/o?"+q.Encode())
@@ -548,8 +550,9 @@ func (s *Server) store(bucket, name, contentType string, metadata map[string]str
 }
 
 type objectMeta struct {
-	ContentType string            `json:"contentType"`
-	Metadata    map[string]string `json:"metadata"`
+	ContentType     string            `json:"contentType"`
+	ContentEncoding string            `json:"contentEncoding"`
+	Metadata        map[string]string `json:"metadata"`
 }
 
 func parseMultipart(contentType string, body []byte) (objectMeta, []byte, error) {
@@ -598,6 +601,9 @@ func objectJSON(bucket, name string, obj *Object) map[string]any {
 	}
 	if len(obj.Metadata) > 0 {
 		m["metadata"] = obj.Metadata
+	}
+	if obj.ContentEncoding != "" {
+		m["contentEncoding"] = obj.ContentEncoding
 	}
 	return m
 }
@@ -716,7 +722,8 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request, partial bool) {
 			writeAPIError(w, http.StatusPreconditionFailed, "conditionNotMet", "At least one of the pre-conditions you specified did not hold.")
 			return
 		}
-		sess.done = s.store(sess.bucket, sess.name, sess.contentType, sess.metadata, sess.data)
+		sess.done = s.store(sess.bucket, sess.name, sess.contentType, sess.meta.Metadata, sess.data)
+		sess.done.ContentEncoding = sess.meta.ContentEncoding
 		s.writeObject(w, sess.bucket, sess.name, sess.done)
 		return
 	}

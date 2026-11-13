@@ -246,7 +246,7 @@ func objectProto(bucket, name string, o *Object, live bool) wire.Buf {
 		size = int64(len(o.Data))
 	}
 	b := wire.Buf(nil).Str(1, name).Str(2, bucketPrefix+bucket).Int(3, o.Generation).Int(4, 1).
-		Str(5, "RAPID").Int(6, size).Str(13, o.ContentType).Msg(14, wire.Timestamp(o.Created))
+		Str(5, "RAPID").Int(6, size).Str(7, o.ContentEncoding).Str(13, o.ContentType).Msg(14, wire.Timestamp(o.Created))
 	for k, v := range o.Metadata {
 		b = b.Msg(22, wire.Buf(nil).Str(1, k).Str(2, v))
 	}
@@ -642,7 +642,7 @@ func (w *writer) create(spec []byte) error {
 	if !appendable {
 		return grpcError(codeInvalidArgument, "only appendable writes are supported")
 	}
-	var bucket, contentType string
+	var bucket, contentType, contentEncoding string
 	var metadata map[string]string
 	err = wire.Fields(res, func(f wire.Field) error {
 		switch f.Num {
@@ -650,6 +650,8 @@ func (w *writer) create(spec []byte) error {
 			w.name = string(f.Data)
 		case 2:
 			bucket = string(f.Data)
+		case 7:
+			contentEncoding = string(f.Data)
 		case 13:
 			contentType = string(f.Data)
 		case 22:
@@ -687,7 +689,7 @@ func (w *writer) create(spec []byte) error {
 	w.s.generation++
 	w.s.epoch++
 	w.gen, w.epoch = w.s.generation, w.s.epoch
-	w.s.objects[w.bucket+"/"+w.name] = &Object{ContentType: contentType, Metadata: metadata, Generation: w.gen, Created: time.Now().UTC(), epoch: w.epoch, Data: []byte{}}
+	w.s.objects[w.bucket+"/"+w.name] = &Object{ContentType: contentType, ContentEncoding: contentEncoding, Metadata: metadata, Generation: w.gen, Created: time.Now().UTC(), epoch: w.epoch, Data: []byte{}}
 	return nil
 }
 

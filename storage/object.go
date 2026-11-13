@@ -50,15 +50,16 @@ func (o *ObjectHandle) Generation(gen int64) *ObjectHandle {
 }
 
 type ObjectAttrs struct {
-	Bucket      string            `json:"bucket"`
-	Name        string            `json:"name"`
-	ContentType string            `json:"contentType"`
-	Size        int64             `json:"size,string"`
-	Generation  int64             `json:"generation,string"`
-	Metadata    map[string]string `json:"metadata"`
-	Created     time.Time         `json:"timeCreated"`
-	Finalized   time.Time         `json:"timeFinalized"`
-	Prefix      string            `json:"-"`
+	Bucket          string            `json:"bucket"`
+	Name            string            `json:"name"`
+	ContentType     string            `json:"contentType"`
+	ContentEncoding string            `json:"contentEncoding"`
+	Size            int64             `json:"size,string"`
+	Generation      int64             `json:"generation,string"`
+	Metadata        map[string]string `json:"metadata"`
+	Created         time.Time         `json:"timeCreated"`
+	Finalized       time.Time         `json:"timeFinalized"`
+	Prefix          string            `json:"-"`
 }
 
 func (o *ObjectHandle) validate() error {

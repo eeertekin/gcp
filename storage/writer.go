@@ -25,6 +25,7 @@ var errWriterClosed = errors.New("storage: writer is closed")
 // sent in one request; larger objects use a resumable upload session.
 type Writer struct {
 	ContentType     string
+	ContentEncoding string
 	Metadata        map[string]string
 	ChunkSize       int
 	Append          bool
@@ -174,8 +175,16 @@ func (w *Writer) uploadURL(uploadType string) string {
 	return w.o.c.endpoint + "/upload/storage/v1/b/" + url.PathEscape(w.o.bucket) + "/o?" + q.Encode()
 }
 
+func (w *Writer) hasMetadata() bool {
+	return len(w.Metadata) > 0 || w.ContentEncoding != ""
+}
+
 func (w *Writer) metadataJSON() ([]byte, error) {
-	return json.Marshal(map[string]any{"contentType": w.contentType(), "metadata": w.Metadata})
+	return json.Marshal(struct {
+		ContentType     string            `json:"contentType"`
+		ContentEncoding string            `json:"contentEncoding,omitempty"`
+		Metadata        map[string]string `json:"metadata,omitempty"`
+	}{w.contentType(), w.ContentEncoding, w.Metadata})
 }
 
 func (w *Writer) uploadSingle() error {
@@ -184,7 +193,7 @@ func (w *Writer) uploadSingle() error {
 	}
 	header := http.Header{"Content-Type": {w.contentType()}}
 	body, uploadType := w.buf, "media"
-	if len(w.Metadata) > 0 {
+	if w.hasMetadata() {
 		meta, err := w.metadataJSON()
 		if err != nil {
 			return err
@@ -218,7 +227,7 @@ func (w *Writer) startSession() error {
 	}
 	header := http.Header{"X-Upload-Content-Type": {w.contentType()}}
 	var meta []byte
-	if len(w.Metadata) > 0 {
+	if w.hasMetadata() {
 		var err error
 		if meta, err = w.metadataJSON(); err != nil {
 			return err

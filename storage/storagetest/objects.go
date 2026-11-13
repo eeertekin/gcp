@@ -1,8 +1,11 @@
 package storagetest
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"slices"
 	"strconv"
@@ -97,6 +100,21 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 	s.calls = append(s.calls, "READ "+key+" "+r.Header.Get("Range"))
 	data := obj.Data
+	if obj.ContentEncoding == "gzip" {
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Write(data)
+			return
+		}
+		zr, err := gzip.NewReader(bytes.NewReader(data))
+		if err == nil {
+			data, err = io.ReadAll(zr)
+		}
+		if err != nil {
+			writeAPIError(w, http.StatusInternalServerError, "backendError", "transcode: "+err.Error())
+			return
+		}
+	}
 	rng := r.Header.Get("Range")
 	if rng == "" {
 		w.Write(data)
@@ -192,5 +210,6 @@ func (s *Server) handleRewrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dst := s.store(bucket, name, obj.ContentType, obj.Metadata, slices.Clone(obj.Data))
+	dst.ContentEncoding = obj.ContentEncoding
 	json.NewEncoder(w).Encode(map[string]any{"kind": "storage#rewriteResponse", "done": true, "resource": objectJSON(bucket, name, dst)})
 }
