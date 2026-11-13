@@ -6,27 +6,27 @@ The public API mirrors the official packages (`cloud.google.com/go/bigquery`, `c
 
 ## Results
 
-Same program using all three services (BigQuery dataset metadata/create/load/copy/query/read rows/list datasets and tables/delete, Storage upload/signed URL/delete, Pub/Sub publish/receive), built with Go 1.27 for `linux/amd64` (`-trimpath`, `CGO_ENABLED=0`). Only the import paths differ between the two builds:
+Same program using all three services (BigQuery dataset metadata/create/load/copy/query/read rows/list datasets and tables/delete, Storage upload/signed URL/delete, Pub/Sub publish/receive), built with Go 1.27 for `linux/amd64` (`-trimpath`, `CGO_ENABLED=0`) against bigquery v1.86.2, storage v1.70.0, pubsub/v2 v2.9.0 and google.golang.org/api v0.314.0. Only the import paths differ between the two builds. Sizes are MiB; cold build is the median of three builds with an empty `GOCACHE`, cross-compiled on a 4-core arm64 host:
 
 | | Official SDKs | stdlib | Difference |
 |---|---|---|---|
-| Stripped binary (`-s -w`) | 39.25 MB | **6.95 MB** | 5.6× smaller |
-| Default binary | 57.34 MB | **10.18 MB** | 5.6× smaller |
+| Stripped binary (`-s -w`) | 39.36 MB | **7.05 MB** | 5.6× smaller |
+| Default binary | 57.49 MB | **10.33 MB** | 5.6× smaller |
 | Modules (`go list -m all`) | 164 | **1** | |
 | Modules linked | 59 | **1** | |
-| Non-standard packages | 534 | **7** | |
-| Cold build | 11.7 s | **3.2 s** | 3.7× faster |
+| Non-standard packages | 534 | **8** | |
+| Cold build | 61.8 s | **16.4 s** | 3.8× faster |
 
 Per service (stripped / default binary):
 
 | Service | Official SDK | stdlib |
 |---|---|---|
-| Storage only | 32.27 MB / 47.23 MB | 6.71 MB / 9.84 MB |
-| Pub/Sub only | 16.81 MB / 24.62 MB | 6.71 MB / 9.85 MB |
-| BigQuery only | 22.13 MB / 32.39 MB | 6.76 MB / 9.91 MB |
-| All three | 39.25 MB / 57.34 MB | 6.95 MB / 10.18 MB |
+| Storage only | 32.40 MB / 47.39 MB | 6.82 MB / 10.01 MB |
+| Pub/Sub only | 16.82 MB / 24.64 MB | 6.72 MB / 9.86 MB |
+| BigQuery only | 22.13 MB / 32.41 MB | 6.76 MB / 9.92 MB |
+| All three | 39.36 MB / 57.49 MB | 7.05 MB / 10.33 MB |
 
-The SDKs grow with every service because each brings its own heavy dependencies (gRPC, protobuf, OpenTelemetry, Apache Arrow, …). The stdlib packages share `net/http` and `crypto`, so adding a service costs only its own logic (~0.1 MB).
+The SDKs grow with every service because each brings its own heavy dependencies (gRPC, protobuf, OpenTelemetry, Apache Arrow, …). The stdlib packages share `net/http` and `crypto`, so adding a service costs only its own logic (~0.1–0.3 MB).
 
 ## Layout
 
