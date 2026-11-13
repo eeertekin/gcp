@@ -140,23 +140,38 @@ func (g *grpcClient) listObjects(ctx context.Context, bucket string, q Query, to
 }
 
 type grpcReader struct {
-	s   *grpcStream
-	buf []byte
+	s      *grpcStream
+	buf    []byte
+	done   bool
+	offset int64
+	length int64
+	want   int64
+	got    int64
 }
 
 func (g *grpcClient) newRangeReader(ctx context.Context, o *ObjectHandle, offset, length int64) (*Reader, error) {
-	req := wire.Buf(nil).Str(1, bucketResourcePrefix+o.bucket).Str(2, o.name).Int(3, o.gen).Int(4, offset)
-	if length > 0 {
-		req = req.Int(5, length)
-	}
-	req = o.conditionFields(req, 6)
-
+	var routingToken string
+	var handle []byte
 	retry := g.c.Retry
 	delay := retry.Initial
 	for attempt := 1; ; attempt++ {
-		r, err := g.openReader(ctx, o, req)
+		spec := wire.Buf(nil).Str(1, bucketResourcePrefix+o.bucket).Str(2, o.name).Int(3, o.gen)
+		spec = o.conditionFields(spec, 4)
+		if handle != nil {
+			spec = spec.Msg(13, wire.Buf(nil).Bytes(1, handle))
+		}
+		if routingToken != "" {
+			spec = spec.Str(14, routingToken)
+		}
+		rng := wire.Buf(nil).Int(1, offset).Int(2, max(length, 0)).Int(3, 1)
+		r, err := g.openReader(ctx, o, wire.Buf(nil).Msg(1, spec).Msg(8, rng), routingToken, &grpcReader{offset: offset, length: length, want: -1})
 		if err == nil {
 			return r, nil
+		}
+		var rd *redirectError
+		if errors.As(err, &rd) && attempt < retry.MaxAttempts {
+			routingToken, handle = rd.routingToken, rd.handle
+			continue
 		}
 		if ok, _ := retryable(err); !ok || attempt >= retry.MaxAttempts || ctx.Err() != nil {
 			return nil, notFound(err)
@@ -168,9 +183,9 @@ func (g *grpcClient) newRangeReader(ctx context.Context, o *ObjectHandle, offset
 	}
 }
 
-func (g *grpcClient) openReader(ctx context.Context, o *ObjectHandle, req wire.Buf) (*Reader, error) {
+func (g *grpcClient) openReader(ctx context.Context, o *ObjectHandle, req wire.Buf, routingToken string, r *grpcReader) (*Reader, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	s, err := g.open(ctx, "ReadObject", bucketParams(o.bucket, ""))
+	s, err := g.open(ctx, "BidiReadObject", bucketParams(o.bucket, routingToken))
 	if err != nil {
 		cancel()
 		return nil, err
@@ -184,10 +199,10 @@ func (g *grpcClient) openReader(ctx context.Context, o *ObjectHandle, req wire.B
 		return fail(s.status())
 	}
 	s.closeSend()
-	r := &grpcReader{s: s}
+	r.s = s
 	msg, err := s.recv()
 	if err == io.EOF {
-		return &Reader{body: r, cancel: cancel}, nil
+		return fail(io.ErrUnexpectedEOF)
 	}
 	if err != nil {
 		return fail(err)
@@ -200,12 +215,31 @@ func (g *grpcClient) openReader(ctx context.Context, o *ObjectHandle, req wire.B
 
 func (r *grpcReader) take(msg []byte) error {
 	return wire.Fields(msg, func(f wire.Field) error {
-		if f.Num != 1 {
+		if f.Num == 4 && r.want < 0 {
+			a, err := parseObject(f.Data)
+			if err != nil {
+				return err
+			}
+			r.want = max(a.Size-r.offset, 0)
+			if r.length >= 0 {
+				r.want = min(r.want, r.length)
+			}
+		}
+		if f.Num != 6 {
 			return nil
 		}
-		data, err := parseChecksummedData(f.Data)
-		r.buf = append(r.buf, data...)
-		return err
+		return wire.Fields(f.Data, func(d wire.Field) error {
+			switch d.Num {
+			case 1:
+				data, err := parseChecksummedData(d.Data)
+				r.buf = append(r.buf, data...)
+				r.got += int64(len(data))
+				return err
+			case 3:
+				r.done = r.done || d.U != 0
+			}
+			return nil
+		})
 	})
 }
 
@@ -230,8 +264,14 @@ func parseChecksummedData(b []byte) ([]byte, error) {
 
 func (r *grpcReader) Read(p []byte) (int, error) {
 	for len(r.buf) == 0 {
+		if r.done {
+			return 0, io.EOF
+		}
 		msg, err := r.s.recv()
 		if err == io.EOF {
+			if r.got < r.want {
+				return 0, io.ErrUnexpectedEOF
+			}
 			return 0, io.EOF
 		}
 		if err != nil {

@@ -213,7 +213,7 @@ func (a *appendWriter) connectOnce() error {
 func (a *appendWriter) reconnect() error {
 	for attempt := 1; ; attempt++ {
 		err := a.connectOnce()
-		var rd *writeRedirect
+		var rd *redirectError
 		if !errors.As(err, &rd) || attempt >= a.g.c.Retry.MaxAttempts {
 			return err
 		}
@@ -235,7 +235,7 @@ func (a *appendWriter) do(op func() error) error {
 	}
 	for attempt := 1; ; attempt++ {
 		err := op()
-		var rd *writeRedirect
+		var rd *redirectError
 		if !errors.As(err, &rd) || attempt >= a.g.c.Retry.MaxAttempts {
 			return err
 		}

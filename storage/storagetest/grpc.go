@@ -27,7 +27,8 @@ const (
 	codeOutOfRange      = 11
 	codeUnimplemented   = 12
 	codeUnauthenticated = 16
-	redirectTypeURL     = "type.googleapis.com/google.storage.v2.BidiWriteObjectRedirectedError"
+	writeRedirectURL    = "type.googleapis.com/google.storage.v2.BidiWriteObjectRedirectedError"
+	readRedirectURL     = "type.googleapis.com/google.storage.v2.BidiReadObjectRedirectedError"
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -135,8 +136,11 @@ func (s *Server) serveGRPC(method string, st *grpcStream) error {
 	if err != nil {
 		return grpcError(codeInvalidArgument, "bad x-goog-request-params: %v", err)
 	}
-	if method == "BidiWriteObject" {
+	switch method {
+	case "BidiWriteObject":
 		return s.bidiWrite(st, params)
+	case "BidiReadObject":
+		return s.bidiRead(st, params)
 	}
 
 	req, err := st.recv()
@@ -168,13 +172,11 @@ func (s *Server) serveGRPC(method string, st *grpcStream) error {
 		return s.grpcDelete(st, b, req)
 	case "ListObjects":
 		return s.grpcList(st, b, req)
-	case "ReadObject":
-		return s.grpcRead(st, b, req)
 	}
 	return grpcError(codeUnimplemented, "method %s is not implemented", method)
 }
 
-func (s *Server) grpcFault(method string, n int, redirect func() wire.Buf) error {
+func (s *Server) grpcFault(method string, n int, redirect func(token string) (string, wire.Buf)) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.grpcFaults) == 0 {
@@ -190,11 +192,11 @@ func (s *Server) grpcFault(method string, n int, redirect func() wire.Buf) error
 	if f.RoutingToken == "" {
 		return grpcError(f.Code, "injected fault")
 	}
-	detail := wire.Buf(nil).Str(1, f.RoutingToken)
-	if redirect != nil {
-		detail = append(detail, redirect()...)
+	if redirect == nil {
+		return grpcError(codeInvalidArgument, "storagetest: %s cannot be redirected", method)
 	}
-	any := wire.Buf(nil).Str(1, redirectTypeURL).Bytes(2, detail)
+	typeURL, detail := redirect(f.RoutingToken)
+	any := wire.Buf(nil).Str(1, typeURL).Bytes(2, detail)
 	return &grpcErr{code: codeAborted, msg: "redirected", details: wire.Buf(nil).Int(1, codeAborted).Str(2, "redirected").Msg(3, any)}
 }
 
@@ -327,46 +329,114 @@ func (s *Server) grpcList(st *grpcStream, bucket string, req []byte) error {
 	return st.send(resp.Str(3, next))
 }
 
-func (s *Server) grpcRead(st *grpcStream, bucket string, req []byte) error {
-	o, err := parseObjectRequest(req, 3, 6, 4, 5)
+func (s *Server) bidiRead(st *grpcStream, params url.Values) error {
+	msg, err := st.recv()
+	if err != nil {
+		return grpcError(codeInvalidArgument, "read request: %v", err)
+	}
+	err = s.grpcFault("BidiReadObject", 1, func(token string) (string, wire.Buf) {
+		return readRedirectURL, wire.Buf(nil).Str(2, token)
+	})
 	if err != nil {
 		return err
 	}
+	var spec []byte
+	var ranges [][3]int64
+	err = wire.Fields(msg, func(f wire.Field) error {
+		switch f.Num {
+		case 1:
+			spec = f.Data
+		case 8:
+			var rr [3]int64
+			wire.Fields(f.Data, func(r wire.Field) error {
+				if r.Num >= 1 && r.Num <= 3 {
+					rr[r.Num-1] = int64(r.U)
+				}
+				return nil
+			})
+			ranges = append(ranges, rr)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if spec == nil {
+		return grpcError(codeInvalidArgument, "the first message must carry read_object_spec")
+	}
+	var bucket, token string
+	wire.Fields(spec, func(f wire.Field) error {
+		switch f.Num {
+		case 1:
+			bucket = string(f.Data)
+		case 14:
+			token = string(f.Data)
+		}
+		return nil
+	})
+	if params.Get("bucket") != bucket {
+		return grpcError(codeInvalidArgument, "x-goog-request-params bucket %q does not match request bucket %q", params.Get("bucket"), bucket)
+	}
+	if token != params.Get("routing_token") {
+		return grpcError(codeInvalidArgument, "routing_token %q is not in x-goog-request-params", token)
+	}
+	o, err := parseObjectRequest(spec, 3, 4, -1, -1)
+	if err != nil {
+		return err
+	}
+	b := strings.TrimPrefix(bucket, bucketPrefix)
 	s.mu.Lock()
-	s.calls = append(s.calls, fmt.Sprintf("GRPC READ %s/%s %d+%d", bucket, o.name, o.offset, o.limit))
-	obj, err := s.lookup(bucket, o)
+	if token != "" {
+		s.routing = append(s.routing, token)
+	}
+	s.calls = append(s.calls, fmt.Sprintf("GRPC READ %s/%s %v", b, o.name, ranges))
+	obj, err := s.lookup(b, o)
 	var data []byte
 	var meta wire.Buf
 	if err == nil {
-		meta = objectProto(bucket, o.name, obj, true)
+		meta = objectProto(b, o.name, obj, true)
 		data = obj.Data
 	}
 	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	if o.offset < 0 || o.limit < 0 {
-		return grpcError(codeInvalidArgument, "negative read_offset or read_limit")
-	}
-	if o.offset > int64(len(data)) {
-		return grpcError(codeOutOfRange, "read_offset %d is past the end of the object (%d bytes)", o.offset, len(data))
-	}
-	data = data[o.offset:]
-	if o.limit > 0 && o.limit < int64(len(data)) {
-		data = data[:o.limit]
-	}
-	for first := true; first || len(data) > 0; first = false {
-		n := min(len(data), maxReadChunk)
-		resp := wire.Buf(nil).Msg(1, wire.Buf(nil).Bytes(1, data[:n]).Fixed32(2, crc32.Checksum(data[:n], castagnoli)))
-		if first {
-			resp = resp.Msg(4, meta)
+
+	pending := wire.Buf(nil).Msg(4, meta).Msg(7, wire.Buf(nil).Bytes(1, epochHandle(uint64(obj.Generation))))
+	for _, rr := range ranges {
+		offset, length, id := rr[0], rr[1], rr[2]
+		if offset < 0 || length < 0 {
+			return grpcError(codeInvalidArgument, "negative read_offset or read_length")
 		}
-		if err := st.send(resp); err != nil {
+		if offset > int64(len(data)) {
+			return grpcError(codeOutOfRange, "read_offset %d is past the end of the object (%d bytes)", offset, len(data))
+		}
+		part := data[offset:]
+		if length > 0 && length < int64(len(part)) {
+			part = part[:length]
+		}
+		for first := true; first || len(part) > 0; first = false {
+			n := min(len(part), maxReadChunk)
+			rangeData := wire.Buf(nil).Msg(1, wire.Buf(nil).Bytes(1, part[:n]).Fixed32(2, crc32.Checksum(part[:n], castagnoli))).
+				Msg(2, wire.Buf(nil).Int(1, offset).Int(2, int64(n)).Int(3, id)).Bool(3, n == len(part))
+			if err := st.send(append(pending, wire.Buf(nil).Msg(6, rangeData)...)); err != nil {
+				return err
+			}
+			pending = nil
+			offset += int64(n)
+			part = part[n:]
+		}
+	}
+	if pending != nil {
+		if err := st.send(pending); err != nil {
 			return err
 		}
-		data = data[n:]
 	}
-	return nil
+	for {
+		if _, err := st.recv(); err != nil {
+			return nil
+		}
+	}
 }
 
 type writeRequest struct {
@@ -464,12 +534,12 @@ func (s *Server) bidiWrite(st *grpcStream, params url.Values) error {
 	}
 }
 
-func (w *writer) redirectDetail() wire.Buf {
-	obj := w.s.objects[w.bucket+"/"+w.name]
-	if w.gen == 0 || obj == nil {
-		return nil
+func (w *writer) redirectDetail(token string) (string, wire.Buf) {
+	detail := wire.Buf(nil).Str(1, token)
+	if obj := w.s.objects[w.bucket+"/"+w.name]; w.gen != 0 && obj != nil {
+		detail = detail.Msg(2, wire.Buf(nil).Bytes(1, epochHandle(w.epoch))).Int(3, w.gen)
 	}
-	return wire.Buf(nil).Msg(2, wire.Buf(nil).Bytes(1, epochHandle(w.epoch))).Int(3, w.gen)
+	return writeRedirectURL, detail
 }
 
 func epochHandle(e uint64) []byte {

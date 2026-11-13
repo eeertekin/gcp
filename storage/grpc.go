@@ -18,9 +18,10 @@ import (
 )
 
 const (
-	grpcService     = "/google.storage.v2.Storage/"
-	maxGRPCMessage  = 64 << 20
-	redirectTypeURL = "type.googleapis.com/google.storage.v2.BidiWriteObjectRedirectedError"
+	grpcService      = "/google.storage.v2.Storage/"
+	maxGRPCMessage   = 64 << 20
+	writeRedirectURL = "type.googleapis.com/google.storage.v2.BidiWriteObjectRedirectedError"
+	readRedirectURL  = "type.googleapis.com/google.storage.v2.BidiReadObjectRedirectedError"
 )
 
 var grpcCodes = [...]struct {
@@ -46,22 +47,22 @@ var grpcCodes = [...]struct {
 	{"Unauthenticated", http.StatusUnauthorized},
 }
 
-type writeRedirect struct {
+type redirectError struct {
 	routingToken string
 	handle       []byte
 	generation   int64
 	err          error
 }
 
-func (e *writeRedirect) Error() string { return e.err.Error() }
-func (e *writeRedirect) Unwrap() error { return e.err }
+func (e *redirectError) Error() string { return e.err.Error() }
+func (e *redirectError) Unwrap() error { return e.err }
 
 func grpcError(code int, msg string, details []byte) error {
 	e := &APIError{Code: http.StatusInternalServerError, Reason: "Code(" + strconv.Itoa(code) + ")", Message: msg}
 	if code >= 0 && code < len(grpcCodes) {
 		e.Code, e.Reason = grpcCodes[code].http, grpcCodes[code].name
 	}
-	var redirect *writeRedirect
+	var redirect *redirectError
 	wire.Fields(details, func(f wire.Field) error {
 		if f.Num != 3 || f.Wire != wire.Bytes {
 			return nil
@@ -77,15 +78,20 @@ func grpcError(code int, msg string, details []byte) error {
 			}
 			return nil
 		})
-		if typeURL != redirectTypeURL {
+		tokenField, handleField := 1, 2
+		switch typeURL {
+		case writeRedirectURL:
+		case readRedirectURL:
+			tokenField, handleField = 2, 1
+		default:
 			return nil
 		}
-		redirect = &writeRedirect{err: e}
+		redirect = &redirectError{err: e}
 		return wire.Fields(value, func(r wire.Field) error {
 			switch r.Num {
-			case 1:
+			case tokenField:
 				redirect.routingToken = string(r.Data)
-			case 2:
+			case handleField:
 				redirect.handle = parseHandle(r.Data)
 			case 3:
 				redirect.generation = int64(r.U)

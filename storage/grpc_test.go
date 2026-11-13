@@ -131,7 +131,10 @@ func TestGRPCUnaryRetry(t *testing.T) {
 func TestGRPCReadRetry(t *testing.T) {
 	s, _, b := grpcSetup(t)
 	s.AddObject(storagetest.Bucket, "obj", []byte("0123456789"))
-	s.InjectGRPCFaults(storagetest.GRPCFault{Method: "ReadObject", Code: codeUnavailable})
+	s.InjectGRPCFaults(
+		storagetest.GRPCFault{Method: "BidiReadObject", Code: codeUnavailable},
+		storagetest.GRPCFault{Method: "BidiReadObject", RoutingToken: "zone-r"},
+	)
 	r, err := b.Object("obj").NewRangeReader(context.Background(), 2, 3)
 	if err != nil {
 		t.Fatal(err)
@@ -140,6 +143,12 @@ func TestGRPCReadRetry(t *testing.T) {
 	r.Close()
 	if err != nil || string(got) != "234" {
 		t.Fatalf("read = %q, %v", got, err)
+	}
+	if !slices.Equal(s.RoutingTokens(), []string{"zone-r"}) {
+		t.Fatalf("routing tokens = %q", s.RoutingTokens())
+	}
+	if strings.Count(strings.Join(s.Calls(), "\n"), "GRPC FAULT BidiReadObject") != 2 {
+		t.Fatalf("faults not consumed: %q", s.Calls())
 	}
 }
 
