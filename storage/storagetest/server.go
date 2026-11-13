@@ -136,10 +136,7 @@ func NewServer(t testing.TB) (*Server, *storage.Client) {
 	s.srv.Config.Protocols.SetHTTP1(true)
 	s.srv.Config.Protocols.SetUnencryptedHTTP2(true)
 	s.srv.Start()
-	t.Cleanup(func() {
-		s.srv.CloseClientConnections()
-		s.srv.Close()
-	})
+	t.Cleanup(s.Close)
 
 	s.creds = s.credentials(key)
 
@@ -203,6 +200,11 @@ func (s *Server) AddObject(bucket, name string, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.store(bucket, name, "", nil, data)
+}
+
+func (s *Server) Close() {
+	s.srv.CloseClientConnections()
+	s.srv.Close()
 }
 
 func (s *Server) CreateBucket(name string) {
