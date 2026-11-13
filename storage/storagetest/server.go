@@ -205,6 +205,28 @@ func (s *Server) AddObject(bucket, name string, data []byte) {
 	s.store(bucket, name, "", nil, data)
 }
 
+func (s *Server) CreateBucket(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.buckets[name] = true
+}
+
+func (s *Server) PutObject(bucket, name string, o Object) Object {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.generation++
+	o.Generation = s.generation
+	if o.Created.IsZero() {
+		o.Created = time.Now().UTC()
+	}
+	if o.Finalized.IsZero() {
+		o.Finalized = o.Created
+	}
+	o.statSize = int64(len(o.Data))
+	s.objects[bucket+"/"+name] = &o
+	return o
+}
+
 func (s *Server) SetPageSize(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

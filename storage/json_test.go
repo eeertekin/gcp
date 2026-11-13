@@ -258,3 +258,14 @@ func TestJSONContentEncodingTranscoded(t *testing.T) {
 		t.Fatalf("read = %q", got)
 	}
 }
+
+func TestPutObjectAndCreateBucket(t *testing.T) {
+	s, c := storagetest.NewServer(t)
+	s.CreateBucket("other")
+	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	s.PutObject("other", "x", storagetest.Object{Data: []byte("abc"), Metadata: map[string]string{"k": "v"}, Created: created})
+	a, err := c.Bucket("other").Object("x").Attrs(context.Background())
+	if err != nil || a.Size != 3 || !a.Created.Equal(created) || !a.Finalized.Equal(created) || a.Metadata["k"] != "v" {
+		t.Fatalf("attrs = %+v, %v", a, err)
+	}
+}
