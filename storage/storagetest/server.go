@@ -1,6 +1,7 @@
 package storagetest
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -13,6 +14,8 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -43,12 +46,20 @@ type Object struct {
 	Data        []byte
 	ContentType string
 	Generation  int64
+	Metadata    map[string]string
+	Created     time.Time
+	Finalized   time.Time
+
+	epoch    uint64
+	statSize int64
 }
 
 type session struct {
 	bucket      string
 	name        string
 	contentType string
+	metadata    map[string]string
+	ifGen       string
 	data        []byte
 	done        *Object
 }
@@ -80,8 +91,12 @@ type Server struct {
 	generation   int64
 	attempts     int
 	faults       []Fault
+	grpcFaults   []GRPCFault
 	tokenFaults  []int
 	quotaProject string
+	pageSize     int
+	epoch        uint64
+	routing      []string
 }
 
 func NewServer(t testing.TB) (*Server, *storage.Client) {
@@ -105,13 +120,25 @@ func NewServer(t testing.TB) (*Server, *storage.Client) {
 	mux.HandleFunc("POST /token", s.handleToken)
 	mux.HandleFunc("GET /computeMetadata/v1/project/project-id", s.handleMetadataProject)
 	mux.HandleFunc("GET /computeMetadata/v1/instance/service-accounts/default/token", s.handleMetadataToken)
+	mux.HandleFunc("GET /storage/v1/b/{b}/o", s.api(s.handleList))
+	mux.HandleFunc("GET /storage/v1/b/{b}/o/{o}", s.api(s.handleGet))
+	mux.HandleFunc("POST /storage/v1/b/{b}/o/{o}/compose", s.api(s.handleCompose))
+	mux.HandleFunc("POST /storage/v1/b/{b}/o/{o}/rewriteTo/b/{db}/o/{do}", s.api(s.handleRewrite))
+	mux.HandleFunc("POST /google.storage.v2.Storage/{method}", s.handleGRPC)
 	mux.HandleFunc("DELETE /storage/v1/b/{b}/o/{o}", s.api(s.handleDelete))
 	mux.HandleFunc("POST /upload/storage/v1/b/{b}/o", s.api(s.handleUpload))
 	mux.HandleFunc("PUT /upload/storage/v1/b/{b}/o", s.api(s.handleChunk))
 	mux.HandleFunc("GET /{b}/{o...}", s.handleSignedGet)
 	mux.HandleFunc("PUT /{b}/{o...}", s.handleSignedPut)
-	s.srv = httptest.NewServer(mux)
-	t.Cleanup(s.srv.Close)
+	s.srv = httptest.NewUnstartedServer(mux)
+	s.srv.Config.Protocols = new(http.Protocols)
+	s.srv.Config.Protocols.SetHTTP1(true)
+	s.srv.Config.Protocols.SetUnencryptedHTTP2(true)
+	s.srv.Start()
+	t.Cleanup(func() {
+		s.srv.CloseClientConnections()
+		s.srv.Close()
+	})
 
 	s.creds = s.credentials(key)
 
@@ -174,8 +201,13 @@ func (s *Server) SetTokenTTL(seconds int) {
 func (s *Server) AddObject(bucket, name string, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.generation++
-	s.objects[bucket+"/"+name] = &Object{Data: data, Generation: s.generation}
+	s.store(bucket, name, "", nil, data)
+}
+
+func (s *Server) SetPageSize(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pageSize = n
 }
 
 func (s *Server) Object(bucket, name string) (Object, bool) {
@@ -411,12 +443,41 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	key := r.PathValue("b") + "/" + r.PathValue("o")
 	s.calls = append(s.calls, "DELETE "+key)
-	if _, ok := s.objects[key]; !ok {
-		writeAPIError(w, http.StatusNotFound, "notFound", "No such object: "+key)
+	if !s.exists(w, r, key) || !s.precondition(w, r.URL.Query(), key) {
 		return
 	}
 	delete(s.objects, key)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) exists(w http.ResponseWriter, r *http.Request, key string) bool {
+	o, ok := s.objects[key]
+	if g := r.URL.Query().Get("generation"); ok && g != "" && g != strconv.FormatInt(o.Generation, 10) {
+		ok = false
+	}
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, "notFound", "No such object: "+key)
+	}
+	return ok
+}
+
+func (s *Server) precondition(w http.ResponseWriter, q url.Values, key string) bool {
+	v := q.Get("ifGenerationMatch")
+	if v == "" {
+		return true
+	}
+	if !generationMatches(s.objects[key], v) {
+		writeAPIError(w, http.StatusPreconditionFailed, "conditionNotMet", "At least one of the pre-conditions you specified did not hold.")
+		return false
+	}
+	return true
+}
+
+func generationMatches(o *Object, want string) bool {
+	if o == nil {
+		return want == "0"
+	}
+	return want == strconv.FormatInt(o.Generation, 10)
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
@@ -441,18 +502,34 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch ut := r.URL.Query().Get("uploadType"); ut {
+	q := r.URL.Query()
+	if !s.precondition(w, q, bucket+"/"+name) {
+		return
+	}
+	switch ut := q.Get("uploadType"); ut {
 	case "media":
 		s.calls = append(s.calls, "UPLOAD "+bucket+"/"+name)
-		obj := s.store(bucket, name, r.Header.Get("Content-Type"), body)
+		obj := s.store(bucket, name, r.Header.Get("Content-Type"), nil, body)
 		s.writeObject(w, bucket, name, obj)
-	case "resumable":
-		if len(body) != 0 {
-			writeAPIError(w, http.StatusBadRequest, "invalid", "unexpected metadata body")
+	case "multipart":
+		meta, data, err := parseMultipart(r.Header.Get("Content-Type"), body)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "invalid", err.Error())
 			return
 		}
+		s.calls = append(s.calls, "MULTIPART "+bucket+"/"+name)
+		obj := s.store(bucket, name, meta.ContentType, meta.Metadata, data)
+		s.writeObject(w, bucket, name, obj)
+	case "resumable":
+		var meta objectMeta
+		if len(body) != 0 {
+			if err := json.Unmarshal(body, &meta); err != nil {
+				writeAPIError(w, http.StatusBadRequest, "invalid", "bad metadata body: "+err.Error())
+				return
+			}
+		}
 		id := randomID()
-		s.sessions[id] = &session{bucket: bucket, name: name, contentType: r.Header.Get("X-Upload-Content-Type")}
+		s.sessions[id] = &session{bucket: bucket, name: name, contentType: r.Header.Get("X-Upload-Content-Type"), metadata: meta.Metadata, ifGen: q.Get("ifGenerationMatch")}
 		s.calls = append(s.calls, "SESSION "+bucket+"/"+name)
 		q := url.Values{"uploadType": {"resumable"}, "name": {name}, "upload_id": {id}}
 		w.Header().Set("Location", s.srv.URL+"/upload/storage/v1/b/"+url.PathEscape(bucket)+"/o?"+q.Encode())
@@ -462,23 +539,79 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) store(bucket, name, contentType string, data []byte) *Object {
+func (s *Server) store(bucket, name, contentType string, metadata map[string]string, data []byte) *Object {
 	s.generation++
-	obj := &Object{Data: data, ContentType: contentType, Generation: s.generation}
+	now := time.Now().UTC()
+	obj := &Object{Data: data, ContentType: contentType, Generation: s.generation, Metadata: metadata, Created: now, Finalized: now, statSize: int64(len(data))}
 	s.objects[bucket+"/"+name] = obj
 	return obj
 }
 
-func (s *Server) writeObject(w http.ResponseWriter, bucket, name string, obj *Object) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+type objectMeta struct {
+	ContentType string            `json:"contentType"`
+	Metadata    map[string]string `json:"metadata"`
+}
+
+func parseMultipart(contentType string, body []byte) (objectMeta, []byte, error) {
+	var meta objectMeta
+	mt, params, err := mime.ParseMediaType(contentType)
+	if err != nil || mt != "multipart/related" {
+		return meta, nil, fmt.Errorf("multipart upload with Content-Type %q", contentType)
+	}
+	mr := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+	var parts [][]byte
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return meta, nil, err
+		}
+		data, err := io.ReadAll(p)
+		if err != nil {
+			return meta, nil, err
+		}
+		parts = append(parts, data)
+	}
+	if len(parts) != 2 {
+		return meta, nil, fmt.Errorf("multipart upload has %d parts, want 2", len(parts))
+	}
+	if err := json.Unmarshal(parts[0], &meta); err != nil {
+		return meta, nil, fmt.Errorf("multipart metadata: %w", err)
+	}
+	return meta, parts[1], nil
+}
+
+func objectJSON(bucket, name string, obj *Object) map[string]any {
+	m := map[string]any{
 		"kind":        "storage#object",
 		"bucket":      bucket,
 		"name":        name,
 		"contentType": obj.ContentType,
-		"size":        strconv.Itoa(len(obj.Data)),
+		"size":        strconv.FormatInt(obj.size(), 10),
 		"generation":  strconv.FormatInt(obj.Generation, 10),
-	})
+		"timeCreated": obj.Created.Format(time.RFC3339Nano),
+	}
+	if !obj.Finalized.IsZero() {
+		m["timeFinalized"] = obj.Finalized.Format(time.RFC3339Nano)
+	}
+	if len(obj.Metadata) > 0 {
+		m["metadata"] = obj.Metadata
+	}
+	return m
+}
+
+func (o *Object) size() int64 {
+	if o.Finalized.IsZero() {
+		return o.statSize
+	}
+	return int64(len(o.Data))
+}
+
+func (s *Server) writeObject(w http.ResponseWriter, bucket, name string, obj *Object) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(objectJSON(bucket, name, obj))
 }
 
 type contentRange struct {
@@ -579,7 +712,11 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request, partial bool) {
 	}
 
 	if !partial && cr.total >= 0 && int64(len(sess.data)) == cr.total {
-		sess.done = s.store(sess.bucket, sess.name, sess.contentType, sess.data)
+		if sess.ifGen != "" && !generationMatches(s.objects[sess.bucket+"/"+sess.name], sess.ifGen) {
+			writeAPIError(w, http.StatusPreconditionFailed, "conditionNotMet", "At least one of the pre-conditions you specified did not hold.")
+			return
+		}
+		sess.done = s.store(sess.bucket, sess.name, sess.contentType, sess.metadata, sess.data)
 		s.writeObject(w, sess.bucket, sess.name, sess.done)
 		return
 	}
@@ -654,7 +791,7 @@ func (s *Server) handleSignedPut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "NoSuchBucket", http.StatusNotFound)
 		return
 	}
-	s.store(bucket, name, r.Header.Get("Content-Type"), body)
+	s.store(bucket, name, r.Header.Get("Content-Type"), nil, body)
 }
 
 // verifySigned independently rebuilds the V4 canonical request from what was
@@ -742,4 +879,14 @@ func randomID() string {
 	b := make([]byte, 12)
 	rand.Read(b)
 	return hex.EncodeToString(b)
+}
+
+func (s *Server) GRPCClient() *storage.Client {
+	c, err := storage.NewGRPCClient(context.Background(), s.ClientOptions()...)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	c.Retry = storage.RetryPolicy{MaxAttempts: 5, Initial: time.Millisecond, Max: 10 * time.Millisecond}
+	s.t.Cleanup(func() { c.Close() })
+	return c
 }

@@ -83,7 +83,19 @@ url, err := client.Bucket("my-bucket").SignedURL("path/file.csv", &storage.Signe
 })
 ```
 
-- **Uploads:** small objects use a single media upload; larger objects use resumable uploads in chunks (`Writer.ChunkSize`, default 16 MiB, aligned to 256 KiB). Interrupted chunks resume from the server's committed offset.
+- **Uploads:** small objects use a single media upload (multipart when `Writer.Metadata` is set); larger objects use resumable uploads in chunks (`Writer.ChunkSize`, default 16 MiB, aligned to 256 KiB). Interrupted chunks resume from the server's committed offset.
+- **Objects:** `Attrs`, `NewReader` / `NewRangeReader`, `Delete`, `Objects` with `Query{Prefix, Delimiter}`, `ComposerFrom`, `CopierFrom`. Preconditions with `If(storage.Conditions{DoesNotExist: true})` or `{GenerationMatch: gen}`, and `Generation(gen)`; a failed precondition is a `*storage.APIError` with `Code` 412.
+- **gRPC and Rapid (zonal) buckets:** `storage.NewGRPCClient` speaks the `google.storage.v2` gRPC API over `net/http`'s HTTP/2 (protobuf encoded by hand), still without dependencies. It covers what zonal buckets offer: appendable writes (`Writer.Append`, `Flush`, `FinalizeOnClose`, takeover with `NewWriterFromAppendableObject`, write redirects with routing tokens), reads, `Attrs`, `Objects` and `Delete`. Plain uploads, compose and copy are not available over gRPC. gRPC errors map to `*storage.APIError` with the HTTP equivalent in `Code` and the gRPC code name in `Reason`. Unlike the official SDK, `FinalizeOnClose` is read when `Close` runs, so it can be set after the first write.
+
+```go
+client, err := storage.NewGRPCClient(ctx)
+w := client.Bucket("my-rapid-bucket").Object("log").If(storage.Conditions{DoesNotExist: true}).NewWriter(ctx)
+w.Append = true
+w.Write(frame)
+persisted, err := w.Flush() // durable and readable
+w.FinalizeOnClose = true
+err = w.Close()
+```
 - **Signed URLs:** V4 (`GOOG4-RSA-SHA256`) for any method, with headers, query parameters, content type/MD5, path-style, virtual-hosted-style or bucket-bound hostnames. Verified against Google's official conformance test suite (26/29 cases; the 3 skipped cases cover emulator hosts and non-default universe domains).
 - **Retries:** exponential backoff with jitter on transport errors, 408/429/5xx, and token-exchange failures.
 
@@ -184,11 +196,13 @@ srv.CreateSubscription("s", "t", pubsubtest.SubscriptionConfig{})
 | Package | Tests |
 |---|---|
 | `bigquery` | 59 (incl. paging, deadline-bounded polling, cancel, idempotent retry, ADC) |
-| `storage` | 55 (incl. Google's V4 signing conformance suite, ADC) |
+| `storage` | 55 (incl. Google's V4 signing conformance suite, ADC), plus JSON object operations and a gRPC suite that runs against both `storagetest` and a real gRPC server |
 | `pubsub` | 46 (incl. a 600-message end-to-end publish → receive, ADC) |
 
 ```sh
 go test -race -timeout 15s ./...
 ```
+
+The gRPC suite can also run against an external `google.storage.v2` server: `STORAGE_GRPC_TEST_ENDPOINT=http://127.0.0.1:9100 STORAGE_GRPC_TEST_BUCKET=<bucket> go test ./storage -run TestGRPCConformance`.
 
 The suites were mutation-checked: deliberately breaking core behaviors (resumable upload probing, signed content type, lease extension, flow control, ordered publishing, nack-on-shutdown, deadline-bounded query polling) makes the corresponding tests fail.

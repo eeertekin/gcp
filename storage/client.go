@@ -28,6 +28,7 @@ type Client struct {
 	quotaProject string
 	email        string
 	key          *rsa.PrivateKey
+	grpc         *grpcClient
 }
 
 func NewClient(ctx context.Context, opts ...option.ClientOption) (*Client, error) {
@@ -140,8 +141,8 @@ func (c *Client) call(ctx context.Context, method, u string, header http.Header,
 	}
 }
 
-func (c *Client) roundTrip(ctx context.Context, method, u string, header http.Header, body []byte) (*response, error) {
-	req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
+func (c *Client) newRequest(ctx context.Context, method, u string, header http.Header, body io.Reader) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, method, u, body)
 	if err != nil {
 		return nil, err
 	}
@@ -156,6 +157,14 @@ func (c *Client) roundTrip(ctx context.Context, method, u string, header http.He
 	req.Header.Set("Authorization", "Bearer "+token)
 	if c.quotaProject != "" {
 		req.Header.Set("X-Goog-User-Project", c.quotaProject)
+	}
+	return req, nil
+}
+
+func (c *Client) roundTrip(ctx context.Context, method, u string, header http.Header, body []byte) (*response, error) {
+	req, err := c.newRequest(ctx, method, u, header, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
 	}
 
 	resp, err := c.http.Do(req)

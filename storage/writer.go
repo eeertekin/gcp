@@ -1,11 +1,14 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
@@ -21,8 +24,11 @@ var errWriterClosed = errors.New("storage: writer is closed")
 // Writer buffers up to ChunkSize bytes. Objects that fit in a single chunk are
 // sent in one request; larger objects use a resumable upload session.
 type Writer struct {
-	ContentType string
-	ChunkSize   int
+	ContentType     string
+	Metadata        map[string]string
+	ChunkSize       int
+	Append          bool
+	FinalizeOnClose bool
 
 	ctx     context.Context
 	o       *ObjectHandle
@@ -32,6 +38,7 @@ type Writer struct {
 	closed  bool
 	err     error
 	attrs   *ObjectAttrs
+	aw      *appendWriter
 }
 
 func (o *ObjectHandle) NewWriter(ctx context.Context) *Writer {
@@ -56,6 +63,20 @@ func (w *Writer) Write(p []byte) (int, error) {
 
 	w.buf = append(w.buf, p...)
 	chunk := w.chunkSize()
+	if w.o.c.grpc != nil {
+		if len(w.buf) >= chunk {
+			aw, err := w.appendable()
+			if err == nil {
+				err = aw.write(w.buf)
+			}
+			if err != nil {
+				w.err = err
+				return 0, err
+			}
+			w.buf = w.buf[:0]
+		}
+		return len(p), nil
+	}
 	for len(w.buf) > chunk {
 		if w.session == "" {
 			if w.err = w.startSession(); w.err != nil {
@@ -76,16 +97,60 @@ func (w *Writer) Close() error {
 	}
 	w.closed = true
 	if w.err != nil {
+		if w.aw != nil && w.aw.c != nil {
+			w.aw.c.s.close()
+		}
 		return w.err
 	}
 
-	if w.session == "" {
+	switch {
+	case w.o.c.grpc != nil:
+		var aw *appendWriter
+		if aw, w.err = w.appendable(); w.err == nil {
+			w.attrs, w.err = aw.close(w.buf, w.FinalizeOnClose)
+		}
+	case w.session == "":
 		w.err = w.uploadSingle()
-	} else {
+	default:
 		w.err = w.send(w.buf, true)
 	}
 	w.buf = nil
 	return w.err
+}
+
+func (w *Writer) Flush() (int64, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	if w.closed {
+		return 0, errWriterClosed
+	}
+	if w.o.c.grpc == nil {
+		return 0, errors.New("storage: Flush needs an appendable writer on a gRPC client (NewGRPCClient)")
+	}
+	aw, err := w.appendable()
+	if err != nil {
+		w.err = err
+		return 0, err
+	}
+	n, err := aw.flush(w.buf)
+	w.buf = w.buf[:0]
+	w.err = err
+	return n, err
+}
+
+func (w *Writer) appendable() (*appendWriter, error) {
+	if w.aw != nil {
+		return w.aw, nil
+	}
+	if err := w.o.validate(); err != nil {
+		return nil, err
+	}
+	if !w.Append {
+		return nil, errAppendOnly
+	}
+	w.aw = &appendWriter{w: w, g: w.o.c.grpc}
+	return w.aw, nil
 }
 
 func (w *Writer) chunkSize() int {
@@ -104,8 +169,13 @@ func (w *Writer) contentType() string {
 }
 
 func (w *Writer) uploadURL(uploadType string) string {
-	q := url.Values{"uploadType": {uploadType}, "name": {w.o.name}}
+	q := w.o.query(url.Values{"uploadType": {uploadType}, "name": {w.o.name}})
+	q.Del("generation")
 	return w.o.c.endpoint + "/upload/storage/v1/b/" + url.PathEscape(w.o.bucket) + "/o?" + q.Encode()
+}
+
+func (w *Writer) metadataJSON() ([]byte, error) {
+	return json.Marshal(map[string]any{"contentType": w.contentType(), "metadata": w.Metadata})
 }
 
 func (w *Writer) uploadSingle() error {
@@ -113,7 +183,29 @@ func (w *Writer) uploadSingle() error {
 		return err
 	}
 	header := http.Header{"Content-Type": {w.contentType()}}
-	resp, _, err := w.o.c.call(w.ctx, http.MethodPost, w.uploadURL("media"), header, w.buf)
+	body, uploadType := w.buf, "media"
+	if len(w.Metadata) > 0 {
+		meta, err := w.metadataJSON()
+		if err != nil {
+			return err
+		}
+		var b bytes.Buffer
+		mw := multipart.NewWriter(&b)
+		for _, part := range []struct {
+			contentType string
+			data        []byte
+		}{{"application/json; charset=UTF-8", meta}, {w.contentType(), w.buf}} {
+			pw, err := mw.CreatePart(textproto.MIMEHeader{"Content-Type": {part.contentType}})
+			if err != nil {
+				return err
+			}
+			pw.Write(part.data)
+		}
+		mw.Close()
+		body, uploadType = b.Bytes(), "multipart"
+		header.Set("Content-Type", "multipart/related; boundary="+mw.Boundary())
+	}
+	resp, _, err := w.o.c.call(w.ctx, http.MethodPost, w.uploadURL(uploadType), header, body)
 	if err != nil {
 		return err
 	}
@@ -125,7 +217,15 @@ func (w *Writer) startSession() error {
 		return err
 	}
 	header := http.Header{"X-Upload-Content-Type": {w.contentType()}}
-	resp, _, err := w.o.c.call(w.ctx, http.MethodPost, w.uploadURL("resumable"), header, nil)
+	var meta []byte
+	if len(w.Metadata) > 0 {
+		var err error
+		if meta, err = w.metadataJSON(); err != nil {
+			return err
+		}
+		header.Set("Content-Type", "application/json; charset=UTF-8")
+	}
+	resp, _, err := w.o.c.call(w.ctx, http.MethodPost, w.uploadURL("resumable"), header, meta)
 	if err != nil {
 		return err
 	}
