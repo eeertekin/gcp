@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -39,6 +40,7 @@ const (
 	UserClientID     = "user-client-id"
 	UserClientSecret = "user-client-secret"
 	UserRefreshToken = "user-refresh-token"
+	HMACAccessID     = "GOOG1ETESTHMACACCESSID"
 	chunkAlign       = 256 << 10
 )
 
@@ -79,6 +81,7 @@ type Server struct {
 	t     testing.TB
 	key   *rsa.PrivateKey
 	pub   *rsa.PublicKey
+	hmac  string
 	srv   *httptest.Server
 	creds []byte
 
@@ -109,11 +112,14 @@ func NewServer(t testing.TB) (*Server, *storage.Client) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	secret := make([]byte, 30)
+	rand.Read(secret)
 
 	s := &Server{
 		t:        t,
 		key:      key,
 		pub:      &key.PublicKey,
+		hmac:     base64.StdEncoding.EncodeToString(secret),
 		tokenTTL: 3600,
 		buckets:  map[string]bool{Bucket: true},
 		objects:  map[string]*Object{},
@@ -815,6 +821,11 @@ func (s *Server) Credentials() []byte {
 	return s.creds
 }
 
+// HMACKey is the HMAC key that signed URLs with GOOG4-HMAC-SHA256 must use.
+func (s *Server) HMACKey() (accessID, secret string) {
+	return HMACAccessID, s.hmac
+}
+
 func (s *Server) AuthorizedUserJSON() []byte {
 	b, _ := json.Marshal(map[string]string{
 		"type":             "authorized_user",
@@ -876,7 +887,8 @@ func (s *Server) handleSignedPut(w http.ResponseWriter, r *http.Request) {
 }
 
 // verifySigned independently rebuilds the V4 canonical request from what was
-// received on the wire and checks it against the service account public key.
+// received on the wire and checks it against the service account public key
+// or the HMAC key.
 func (s *Server) verifySigned(w http.ResponseWriter, r *http.Request) bool {
 	fail := func(code int, format string, args ...any) bool {
 		msg := fmt.Sprintf(format, args...)
@@ -888,8 +900,10 @@ func (s *Server) verifySigned(w http.ResponseWriter, r *http.Request) bool {
 	}
 
 	q := r.URL.Query()
-	if a := q.Get("X-Goog-Algorithm"); a != "GOOG4-RSA-SHA256" {
-		return fail(http.StatusBadRequest, "algorithm %q", a)
+	algorithm := q.Get("X-Goog-Algorithm")
+	accessID := map[string]string{"GOOG4-RSA-SHA256": ClientEmail, "GOOG4-HMAC-SHA256": HMACAccessID}[algorithm]
+	if accessID == "" {
+		return fail(http.StatusBadRequest, "algorithm %q", algorithm)
 	}
 	sig, err := hex.DecodeString(q.Get("X-Goog-Signature"))
 	if err != nil || len(sig) == 0 {
@@ -907,7 +921,7 @@ func (s *Server) verifySigned(w http.ResponseWriter, r *http.Request) bool {
 		return fail(http.StatusBadRequest, "ExpiredToken")
 	}
 	scope := date.Format("20060102") + "/auto/storage/goog4_request"
-	if c := q.Get("X-Goog-Credential"); c != ClientEmail+"/"+scope {
+	if c := q.Get("X-Goog-Credential"); c != accessID+"/"+scope {
 		return fail(http.StatusForbidden, "credential %q", c)
 	}
 
@@ -948,7 +962,22 @@ func (s *Server) verifySigned(w http.ResponseWriter, r *http.Request) bool {
 
 	canonical := strings.Join([]string{r.Method, path, query, headers.String(), strings.Join(signed, ";"), payload}, "\n")
 	sum := sha256.Sum256([]byte(canonical))
-	toSign := "GOOG4-RSA-SHA256\n" + q.Get("X-Goog-Date") + "\n" + scope + "\n" + hex.EncodeToString(sum[:])
+	toSign := algorithm + "\n" + q.Get("X-Goog-Date") + "\n" + scope + "\n" + hex.EncodeToString(sum[:])
+	if algorithm == "GOOG4-HMAC-SHA256" {
+		mac := func(key []byte, data string) []byte {
+			h := hmac.New(sha256.New, key)
+			h.Write([]byte(data))
+			return h.Sum(nil)
+		}
+		kDate := mac([]byte("GOOG4"+s.hmac), date.Format("20060102"))
+		kLocation := mac(kDate, "auto")
+		kService := mac(kLocation, "storage")
+		kSigning := mac(kService, "goog4_request")
+		if !hmac.Equal(mac(kSigning, toSign), sig) {
+			return fail(http.StatusForbidden, "SignatureDoesNotMatch")
+		}
+		return true
+	}
 	digest := sha256.Sum256([]byte(toSign))
 	if err := rsa.VerifyPKCS1v15(s.pub, crypto.SHA256, digest[:], sig); err != nil {
 		return fail(http.StatusForbidden, "SignatureDoesNotMatch")

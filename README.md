@@ -51,7 +51,7 @@ All three clients accept a **service account** key or **user credentials**. For 
 
 When no credentials option is given, every client uses **Application Default Credentials**: `GOOGLE_APPLICATION_CREDENTIALS`, then the gcloud file from `gcloud auth application-default login` (service account or user credentials), then the GCE / Cloud Run / GKE metadata server. `DetectProjectID` takes the project from whichever credentials were found.
 
-Storage signed URLs are signed locally with a service account key. With metadata-server credentials they are signed through the IAM Credentials `signBlob` API as the VM's service account (it needs `iam.serviceAccounts.signBlob` on itself, e.g. Service Account Token Creator, and the `cloud-platform` scope). With user credentials, `SignedURL` returns an error unless `GoogleAccessID` and `PrivateKey` or `SignBytes` are set.
+Storage signed URLs are signed locally with a service account key. With metadata-server credentials they are signed through the IAM Credentials `signBlob` API as the VM's service account (it needs `iam.serviceAccounts.signBlob` on itself, e.g. Service Account Token Creator, and the `cloud-platform` scope). With user credentials, `SignedURL` returns an error unless `GoogleAccessID` and `PrivateKey` or `SignBytes` are set. With an **HMAC key** (`GoogleAccessID` set to the key's access ID and `HMACSecret` to its secret), URLs are signed locally with `GOOG4-HMAC-SHA256`: no client, no RSA key, no network call, whatever the client's credentials are.
 
 ```go
 import "github.com/eeertekin/gcp/option"
@@ -82,6 +82,13 @@ url, err := client.Bucket("my-bucket").SignedURL("path/file.csv", &storage.Signe
 	Method:  "GET",
 	Expires: time.Now().Add(15 * time.Minute),
 })
+
+url, err = storage.SignedURL("my-bucket", "path/file.csv", &storage.SignedURLOptions{
+	GoogleAccessID: hmacAccessID, // GOOG1E...
+	HMACSecret:     hmacSecret,
+	Method:         "GET",
+	Expires:        time.Now().Add(15 * time.Second),
+})
 ```
 
 - **Uploads:** small objects use a single media upload (multipart when `Writer.Metadata`, `Writer.ContentEncoding` or `Writer.ContentDisposition` is set); larger objects use resumable uploads in chunks (`Writer.ChunkSize`, default 16 MiB, aligned to 256 KiB). Interrupted chunks resume from the server's committed offset.
@@ -97,7 +104,7 @@ persisted, err := w.Flush() // durable and readable
 w.FinalizeOnClose = true
 err = w.Close()
 ```
-- **Signed URLs:** V4 (`GOOG4-RSA-SHA256`) for any method, with headers, query parameters, content type/MD5, path-style, virtual-hosted-style or bucket-bound hostnames. Verified against Google's official conformance test suite (26/29 cases; the 3 skipped cases cover emulator hosts and non-default universe domains).
+- **Signed URLs:** V4 (`GOOG4-RSA-SHA256`, or `GOOG4-HMAC-SHA256` with `HMACSecret`) for any method, with headers, query parameters, content type/MD5, path-style, virtual-hosted-style or bucket-bound hostnames. Verified against Google's official conformance test suite (26/29 cases; the 3 skipped cases cover emulator hosts and non-default universe domains).
 - **Retries:** exponential backoff with jitter on transport errors, 408/429/5xx, and token-exchange failures.
 
 ## BigQuery — `github.com/eeertekin/gcp/bigquery`
@@ -197,7 +204,7 @@ srv.CreateSubscription("s", "t", pubsubtest.SubscriptionConfig{})
 | Package | Tests |
 |---|---|
 | `bigquery` | 59 (incl. paging, deadline-bounded polling, cancel, idempotent retry, ADC) |
-| `storage` | 80 (incl. Google's V4 signing conformance suite, ADC, JSON object operations, and a gRPC suite that runs against both `storagetest` and a real gRPC server) |
+| `storage` | 85 (incl. Google's V4 signing conformance suite, HMAC signed URL known answers, ADC, JSON object operations, and a gRPC suite that runs against both `storagetest` and a real gRPC server) |
 | `pubsub` | 46 (incl. a 600-message end-to-end publish → receive, ADC) |
 
 ```sh
@@ -205,5 +212,7 @@ go test -race -timeout 15s ./...
 ```
 
 The gRPC suite can also run against an external `google.storage.v2` server: `STORAGE_GRPC_TEST_ENDPOINT=http://127.0.0.1:9100 STORAGE_GRPC_TEST_BUCKET=<bucket> go test ./storage -run TestGRPCConformance`.
+
+`storagetest` verifies HMAC signed URLs made with the key from `Server.HMACKey()`; they can also be checked against real GCS: `STORAGE_HMAC_TEST_BUCKET=<bucket> STORAGE_HMAC_TEST_OBJECT=<object> STORAGE_HMAC_TEST_ACCESS_ID=<access id> STORAGE_HMAC_TEST_SECRET=<secret> go test ./storage -run TestSignedURLHMACLive`.
 
 The suites were mutation-checked: deliberately breaking core behaviors (resumable upload probing, signed content type, lease extension, flow control, ordered publishing, nack-on-shutdown, deadline-bounded query polling) makes the corresponding tests fail.

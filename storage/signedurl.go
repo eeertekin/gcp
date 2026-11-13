@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"crypto"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -71,6 +72,7 @@ type SignedURLOptions struct {
 	GoogleAccessID  string
 	PrivateKey      []byte
 	SignBytes       func([]byte) ([]byte, error)
+	HMACSecret      string
 	Method          string
 	Expires         time.Time
 	ContentType     string
@@ -89,11 +91,15 @@ func SignedURL(bucket, object string, opts *SignedURLOptions) (string, error) {
 
 // SignedURL fills GoogleAccessID and the signing key from the client's
 // service account when they are not set, and signs for the client endpoint.
+// With HMACSecret set it signs locally with GoogleAccessID as the HMAC access ID.
 func (b *BucketHandle) SignedURL(object string, opts *SignedURLOptions) (string, error) {
 	if opts == nil {
 		return "", errors.New("storage: missing required SignedURLOptions")
 	}
 	o := *opts
+	if o.HMACSecret != "" {
+		return signURL(b.name, object, &o, b.c.endpoint, time.Now())
+	}
 	if b.c.key == nil && b.c.iamTokens != nil && o.SignBytes == nil && len(o.PrivateKey) == 0 {
 		if o.GoogleAccessID == "" {
 			o.GoogleAccessID = b.c.email
@@ -273,7 +279,11 @@ func signURL(bucket, object string, opts *SignedURLOptions, endpoint string, now
 	for k, vs := range opts.QueryParameters {
 		q[k] = slices.Clone(vs)
 	}
-	q.Set("X-Goog-Algorithm", "GOOG4-RSA-SHA256")
+	algorithm := "GOOG4-RSA-SHA256"
+	if opts.HMACSecret != "" {
+		algorithm = "GOOG4-HMAC-SHA256"
+	}
+	q.Set("X-Goog-Algorithm", algorithm)
 	q.Set("X-Goog-Credential", opts.GoogleAccessID+"/"+scope)
 	q.Set("X-Goog-Date", timestamp)
 	q.Set("X-Goog-Expires", strconv.FormatInt(int64(ttl/time.Second), 10))
@@ -287,7 +297,7 @@ func signURL(bucket, object string, opts *SignedURLOptions, endpoint string, now
 
 	canonicalRequest := strings.Join([]string{method, path, query, canonicalHeaders.String(), signedHeaders, payload}, "\n")
 	sum := sha256.Sum256([]byte(canonicalRequest))
-	stringToSign := "GOOG4-RSA-SHA256\n" + timestamp + "\n" + scope + "\n" + hex.EncodeToString(sum[:])
+	stringToSign := algorithm + "\n" + timestamp + "\n" + scope + "\n" + hex.EncodeToString(sum[:])
 
 	sig, err := sign([]byte(stringToSign))
 	if err != nil {
@@ -297,8 +307,18 @@ func signURL(bucket, object string, opts *SignedURLOptions, endpoint string, now
 }
 
 func signer(opts *SignedURLOptions) (func([]byte) ([]byte, error), error) {
-	if (opts.SignBytes == nil) == (len(opts.PrivateKey) == 0) {
-		return nil, errors.New("storage: exactly one of PrivateKey or SignBytes must be set")
+	set := 0
+	for _, ok := range []bool{len(opts.PrivateKey) > 0, opts.SignBytes != nil, opts.HMACSecret != ""} {
+		if ok {
+			set++
+		}
+	}
+	if set != 1 {
+		return nil, errors.New("storage: exactly one of PrivateKey, SignBytes or HMACSecret must be set")
+	}
+	if opts.HMACSecret != "" {
+		secret := opts.HMACSecret
+		return func(p []byte) ([]byte, error) { return signHMAC(secret, p), nil }, nil
 	}
 	if opts.SignBytes != nil {
 		return opts.SignBytes, nil
@@ -312,6 +332,23 @@ func signer(opts *SignedURLOptions) (func([]byte) ([]byte, error), error) {
 		return nil, err
 	}
 	return func(p []byte) ([]byte, error) { return signRSA(key, p) }, nil
+}
+
+// signHMAC derives the GOOG4 signing key from the scope on the third line of
+// the string to sign: date, location, service and request type.
+func signHMAC(secret string, stringToSign []byte) []byte {
+	scope := strings.Split(string(stringToSign), "\n")[2]
+	key := []byte("GOOG4" + secret)
+	for _, part := range strings.Split(scope, "/") {
+		key = hmacSHA256(key, []byte(part))
+	}
+	return hmacSHA256(key, stringToSign)
+}
+
+func hmacSHA256(key, data []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	mac.Write(data)
+	return mac.Sum(nil)
 }
 
 // escapeV4 percent-encodes everything except RFC 3986 unreserved characters.

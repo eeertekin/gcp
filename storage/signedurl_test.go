@@ -337,3 +337,124 @@ func TestSignedURLValidation(t *testing.T) {
 		t.Fatalf("signing made %d API calls", n)
 	}
 }
+
+func hmacOptions(s *storagetest.Server, secret string, expires time.Time) *storage.SignedURLOptions {
+	id, _ := s.HMACKey()
+	return &storage.SignedURLOptions{
+		GoogleAccessID: id,
+		HMACSecret:     secret,
+		Method:         http.MethodGet,
+		Expires:        expires,
+		Hostname:       strings.TrimPrefix(s.URL(), "http://"),
+		Insecure:       true,
+	}
+}
+
+func TestSignedURLHMAC(t *testing.T) {
+	s, c := storagetest.NewServer(t)
+	s.AddObject(storagetest.Bucket, "a", []byte("A"))
+	s.AddObject(storagetest.Bucket, "b", []byte("B"))
+	_, secret := s.HMACKey()
+	future := time.Now().Add(time.Minute)
+
+	u, err := storage.SignedURL(storagetest.Bucket, "a", hmacOptions(s, secret, future))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(u, "X-Goog-Algorithm=GOOG4-HMAC-SHA256&X-Goog-Credential="+storagetest.HMACAccessID+"%2F") {
+		t.Fatalf("url = %s", u)
+	}
+	if code, body := do(t, http.MethodGet, u, nil); code != http.StatusOK || string(body) != "A" {
+		t.Fatalf("GET: %d %q", code, body)
+	}
+
+	wrong, err := storage.SignedURL(storagetest.Bucket, "a", hmacOptions(s, secret+"x", future))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, body := do(t, http.MethodGet, wrong, nil); code != http.StatusForbidden {
+		t.Errorf("wrong secret: %d %s, want 403", code, body)
+	}
+
+	hourAgo := time.Now().Add(-time.Hour)
+	expired, err := storage.SignedURLAt(storagetest.Bucket, "a", hmacOptions(s, secret, hourAgo.Add(time.Minute)), hourAgo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, body := do(t, http.MethodGet, expired, nil); code != http.StatusBadRequest || !strings.Contains(string(body), "ExpiredToken") {
+		t.Errorf("expired: %d %s", code, body)
+	}
+
+	tampered := strings.Replace(u, "/"+storagetest.Bucket+"/a?", "/"+storagetest.Bucket+"/b?", 1)
+	if tampered == u {
+		t.Fatal("tampering did not change the url")
+	}
+	if code, body := do(t, http.MethodGet, tampered, nil); code != http.StatusForbidden {
+		t.Errorf("tampered path: %d %s, want 403", code, body)
+	}
+
+	bu, err := c.Bucket(storagetest.Bucket).SignedURL("b", &storage.SignedURLOptions{
+		GoogleAccessID: storagetest.HMACAccessID,
+		HMACSecret:     secret,
+		Method:         http.MethodGet,
+		Expires:        future,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, body := do(t, http.MethodGet, bu, nil); code != http.StatusOK || string(body) != "B" {
+		t.Fatalf("bucket GET: %d %q", code, body)
+	}
+}
+
+func TestSignedURLHMACWithMetadataCredentials(t *testing.T) {
+	isolateADC(t)
+	s, _ := storagetest.NewServer(t)
+	t.Setenv("GCE_METADATA_HOST", s.Host())
+	s.AddObject(storagetest.Bucket, "o", []byte("local"))
+	c := adcClient(t, s)
+	storage.SetIAMEndpoint(c, s.URL())
+	id, secret := s.HMACKey()
+	b := c.Bucket(storagetest.Bucket)
+
+	if _, err := b.SignedURL("o", &storage.SignedURLOptions{HMACSecret: secret, Method: http.MethodGet, Expires: time.Now().Add(time.Minute)}); err == nil {
+		t.Fatal("HMACSecret without GoogleAccessID must fail, not use the client email")
+	}
+	u, err := b.SignedURL("o", &storage.SignedURLOptions{GoogleAccessID: id, HMACSecret: secret, Method: http.MethodGet, Expires: time.Now().Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, body := do(t, http.MethodGet, u, nil); code != http.StatusOK || string(body) != "local" {
+		t.Fatalf("signed GET = %d %q", code, body)
+	}
+	for _, call := range s.Calls() {
+		if strings.HasPrefix(call, "SIGNBLOB") {
+			t.Fatalf("HMAC signing called signBlob: %q", s.Calls())
+		}
+	}
+}
+
+func TestSignedURLHMACValidation(t *testing.T) {
+	s, _ := storagetest.NewServer(t)
+	email, key := testCreds(t, s)
+	id, secret := s.HMACKey()
+	sign := func([]byte) ([]byte, error) { return []byte("sig"), nil }
+	future := time.Now().Add(time.Minute)
+
+	cases := map[string]*storage.SignedURLOptions{
+		"missing access id": {HMACSecret: secret, Method: "GET", Expires: future},
+		"secret and key":    {GoogleAccessID: id, HMACSecret: secret, PrivateKey: key, Method: "GET", Expires: future},
+		"secret and signer": {GoogleAccessID: email, HMACSecret: secret, SignBytes: sign, Method: "GET", Expires: future},
+		"invalid method":    {GoogleAccessID: id, HMACSecret: secret, Method: "PATCH", Expires: future},
+		"expires too far":   {GoogleAccessID: id, HMACSecret: secret, Method: "GET", Expires: time.Now().Add(8 * 24 * time.Hour)},
+	}
+	for name, opts := range cases {
+		if _, err := storage.SignedURL(storagetest.Bucket, "o", opts); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
+	}
+	_, err := storage.SignedURL(storagetest.Bucket, "o", &storage.SignedURLOptions{GoogleAccessID: id, HMACSecret: secret, PrivateKey: key, Method: "GET", Expires: future})
+	if err == nil || !strings.Contains(err.Error(), "HMACSecret") {
+		t.Fatalf("error must name HMACSecret: %v", err)
+	}
+}
