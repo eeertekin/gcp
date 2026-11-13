@@ -25,6 +25,7 @@ import (
 const (
 	defaultTokenURI     = "https://oauth2.googleapis.com/token"
 	tokenScope          = "https://www.googleapis.com/auth/devstorage.read_write"
+	iamScope            = "https://www.googleapis.com/auth/cloud-platform"
 	defaultMetadataHost = "metadata.google.internal"
 	metadataProbeLimit  = 3 * time.Second
 )
@@ -45,6 +46,7 @@ type credentialsFile struct {
 type credentials struct {
 	quotaProject string
 	tokens       *tokenSource
+	iamTokens    *tokenSource
 	email        string
 	key          *rsa.PrivateKey
 }
@@ -89,16 +91,23 @@ func findCredentials(ctx context.Context, s option.Settings, hc *http.Client) (*
 	if _, err := metadataProjectID(ctx, hc, host); err != nil {
 		return nil, fmt.Errorf("storage: no credentials: set GOOGLE_APPLICATION_CREDENTIALS, run `gcloud auth application-default login`, or run on Google Cloud (metadata server: %w)", err)
 	}
-	u := "http://" + host + "/computeMetadata/v1/instance/service-accounts/default/token?scopes=" + url.QueryEscape(tokenScope)
+	email, _ := metadataGet(ctx, hc, host, "instance/service-accounts/default/email")
 	return &credentials{
-		tokens: &tokenSource{tokenURI: u, http: hc, request: func(ctx context.Context) (*http.Request, error) {
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-			if err == nil {
-				req.Header.Set("Metadata-Flavor", "Google")
-			}
-			return req, err
-		}},
+		tokens:    metadataTokens(hc, host, tokenScope),
+		iamTokens: metadataTokens(hc, host, iamScope),
+		email:     email,
 	}, nil
+}
+
+func metadataTokens(hc *http.Client, host, scope string) *tokenSource {
+	u := "http://" + host + "/computeMetadata/v1/instance/service-accounts/default/token?scopes=" + url.QueryEscape(scope)
+	return &tokenSource{tokenURI: u, http: hc, request: func(ctx context.Context) (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err == nil {
+			req.Header.Set("Metadata-Flavor", "Google")
+		}
+		return req, err
+	}}
 }
 
 func gcloudCredentialsPath() string {
@@ -114,9 +123,13 @@ func gcloudCredentialsPath() string {
 }
 
 func metadataProjectID(ctx context.Context, hc *http.Client, host string) (string, error) {
+	return metadataGet(ctx, hc, host, "project/project-id")
+}
+
+func metadataGet(ctx context.Context, hc *http.Client, host, path string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, metadataProbeLimit)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+host+"/computeMetadata/v1/project/project-id", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+host+"/computeMetadata/v1/"+path, nil)
 	if err != nil {
 		return "", err
 	}
@@ -131,7 +144,7 @@ func metadataProjectID(ctx context.Context, hc *http.Client, host string) (strin
 		return "", err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("project-id: %s", resp.Status)
+		return "", fmt.Errorf("%s: %s", path, resp.Status)
 	}
 	return strings.TrimSpace(string(body)), nil
 }

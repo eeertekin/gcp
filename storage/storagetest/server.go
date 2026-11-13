@@ -76,6 +76,7 @@ type Fault struct {
 
 type Server struct {
 	t     testing.TB
+	key   *rsa.PrivateKey
 	pub   *rsa.PublicKey
 	srv   *httptest.Server
 	creds []byte
@@ -110,6 +111,7 @@ func NewServer(t testing.TB) (*Server, *storage.Client) {
 
 	s := &Server{
 		t:        t,
+		key:      key,
 		pub:      &key.PublicKey,
 		tokenTTL: 3600,
 		buckets:  map[string]bool{Bucket: true},
@@ -121,6 +123,8 @@ func NewServer(t testing.TB) (*Server, *storage.Client) {
 	mux.HandleFunc("POST /token", s.handleToken)
 	mux.HandleFunc("GET /computeMetadata/v1/project/project-id", s.handleMetadataProject)
 	mux.HandleFunc("GET /computeMetadata/v1/instance/service-accounts/default/token", s.handleMetadataToken)
+	mux.HandleFunc("GET /computeMetadata/v1/instance/service-accounts/default/email", s.handleMetadataEmail)
+	mux.HandleFunc("POST /v1/projects/-/serviceAccounts/{sa}", s.handleSignBlob)
 	mux.HandleFunc("GET /storage/v1/b/{b}/o", s.api(s.handleList))
 	mux.HandleFunc("GET /storage/v1/b/{b}/o/{o}", s.api(s.handleGet))
 	mux.HandleFunc("POST /storage/v1/b/{b}/o/{o}/compose", s.api(s.handleCompose))
@@ -378,10 +382,49 @@ func (s *Server) handleMetadataToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing Metadata-Flavor", http.StatusForbidden)
 		return
 	}
-	if !strings.Contains(r.URL.Query().Get("scopes"), "https://www.googleapis.com/auth/devstorage.") {
+	if scopes := r.URL.Query().Get("scopes"); !strings.Contains(scopes, "https://www.googleapis.com/auth/devstorage.") && scopes != "https://www.googleapis.com/auth/cloud-platform" {
 		s.t.Errorf("storagetest: metadata token scopes = %q", r.URL.Query().Get("scopes"))
 	}
 	s.issueToken(w)
+}
+
+func (s *Server) handleMetadataEmail(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Metadata-Flavor") != "Google" {
+		http.Error(w, "missing Metadata-Flavor", http.StatusForbidden)
+		return
+	}
+	io.WriteString(w, ClientEmail)
+}
+
+func (s *Server) handleSignBlob(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	ok := s.authorized(w, r)
+	s.calls = append(s.calls, "SIGNBLOB "+r.PathValue("sa"))
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	if r.PathValue("sa") != ClientEmail+":signBlob" {
+		writeAPIError(w, http.StatusNotFound, "notFound", "unknown service account "+r.PathValue("sa"))
+		return
+	}
+	var req struct {
+		Payload string `json:"payload"`
+	}
+	payload, err := []byte(nil), json.NewDecoder(r.Body).Decode(&req)
+	if err == nil {
+		payload, err = base64.StdEncoding.DecodeString(req.Payload)
+	}
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid", err.Error())
+		return
+	}
+	sum := sha256.Sum256(payload)
+	sig, err := rsa.SignPKCS1v15(rand.Reader, s.key, crypto.SHA256, sum[:])
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	json.NewEncoder(w).Encode(map[string]string{"keyId": KeyID, "signedBlob": base64.StdEncoding.EncodeToString(sig)})
 }
 
 func (s *Server) verifyJWT(assertion string) error {

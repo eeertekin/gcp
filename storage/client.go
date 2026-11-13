@@ -15,7 +15,10 @@ import (
 	"github.com/eeertekin/gcp/option"
 )
 
-const defaultEndpoint = "https://storage.googleapis.com"
+const (
+	defaultEndpoint    = "https://storage.googleapis.com"
+	defaultIAMEndpoint = "https://iamcredentials.googleapis.com"
+)
 
 var ErrObjectNotExist = errors.New("storage: object doesn't exist")
 
@@ -23,8 +26,10 @@ type Client struct {
 	Retry RetryPolicy
 
 	endpoint     string
+	iamEndpoint  string
 	http         *http.Client
 	tokens       *tokenSource
+	iamTokens    *tokenSource
 	quotaProject string
 	email        string
 	key          *rsa.PrivateKey
@@ -60,8 +65,10 @@ func NewClient(ctx context.Context, opts ...option.ClientOption) (*Client, error
 	return &Client{
 		Retry:        defaultRetryPolicy(),
 		endpoint:     endpoint,
+		iamEndpoint:  defaultIAMEndpoint,
 		http:         hc,
 		tokens:       creds.tokens,
+		iamTokens:    creds.iamTokens,
 		quotaProject: creds.quotaProject,
 		email:        creds.email,
 		key:          creds.key,

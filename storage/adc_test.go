@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -146,8 +147,28 @@ func TestADCMetadataServer(t *testing.T) {
 	if q := s.QuotaProject(); q != "" {
 		t.Fatalf("quota project %q sent for metadata credentials", q)
 	}
-	if _, err := c.Bucket(storagetest.Bucket).SignedURL("a", &storage.SignedURLOptions{Method: http.MethodGet, Expires: time.Now().Add(time.Minute)}); err == nil {
-		t.Fatal("metadata credentials have no key to sign with")
+}
+
+func TestSignedURLWithMetadataCredentials(t *testing.T) {
+	isolateADC(t)
+	s, _ := storagetest.NewServer(t)
+	t.Setenv("GCE_METADATA_HOST", s.Host())
+	s.AddObject(storagetest.Bucket, "o", []byte("signed by iam"))
+	c := adcClient(t, s)
+	storage.SetIAMEndpoint(c, s.URL())
+
+	u, err := c.Bucket(storagetest.Bucket).SignedURL("o", &storage.SignedURLOptions{Method: http.MethodGet, Expires: time.Now().Add(time.Minute)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, body := do(t, http.MethodGet, u, nil); code != http.StatusOK || string(body) != "signed by iam" {
+		t.Fatalf("signed GET = %d %q", code, body)
+	}
+	if !slices.Contains(s.Calls(), "SIGNBLOB "+storagetest.ClientEmail+":signBlob") {
+		t.Fatalf("no signBlob call: %q", s.Calls())
+	}
+	if _, err := c.Bucket(storagetest.Bucket).SignedURL("o", &storage.SignedURLOptions{GoogleAccessID: "other@x.iam.gserviceaccount.com", Method: http.MethodGet, Expires: time.Now().Add(time.Minute)}); err == nil {
+		t.Fatal("signBlob for an unknown service account succeeded")
 	}
 }
 

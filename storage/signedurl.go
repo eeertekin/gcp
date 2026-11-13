@@ -1,15 +1,20 @@
 package storage
 
 import (
+	"bytes"
 	"cmp"
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -89,6 +94,16 @@ func (b *BucketHandle) SignedURL(object string, opts *SignedURLOptions) (string,
 		return "", errors.New("storage: missing required SignedURLOptions")
 	}
 	o := *opts
+	if b.c.key == nil && b.c.iamTokens != nil && o.SignBytes == nil && len(o.PrivateKey) == 0 {
+		if o.GoogleAccessID == "" {
+			o.GoogleAccessID = b.c.email
+		}
+		if o.GoogleAccessID == "" {
+			return "", errors.New("storage: the metadata server reported no service account email: set GoogleAccessID")
+		}
+		email := o.GoogleAccessID
+		o.SignBytes = func(p []byte) ([]byte, error) { return b.c.signBlob(email, p) }
+	}
 	if b.c.key == nil && (o.GoogleAccessID == "" || (o.SignBytes == nil && len(o.PrivateKey) == 0)) {
 		return "", errors.New("storage: client credentials have no service account key: set GoogleAccessID and PrivateKey or SignBytes")
 	}
@@ -100,6 +115,62 @@ func (b *BucketHandle) SignedURL(object string, opts *SignedURLOptions) (string,
 		o.SignBytes = func(p []byte) ([]byte, error) { return signRSA(key, p) }
 	}
 	return signURL(b.name, object, &o, b.c.endpoint, time.Now())
+}
+
+func (c *Client) signBlob(email string, p []byte) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	body, err := json.Marshal(map[string]string{"payload": base64.StdEncoding.EncodeToString(p)})
+	if err != nil {
+		return nil, err
+	}
+	u := c.iamEndpoint + "/v1/projects/-/serviceAccounts/" + url.PathEscape(email) + ":signBlob"
+	delay := c.Retry.Initial
+	for attempt := 1; ; attempt++ {
+		sig, err := c.signBlobOnce(ctx, u, body)
+		if err == nil {
+			return sig, nil
+		}
+		if retry, _ := retryable(err); !retry || attempt >= c.Retry.MaxAttempts {
+			return nil, fmt.Errorf("storage: signBlob for %s: %w", email, err)
+		}
+		if err := sleep(ctx, jitter(delay)); err != nil {
+			return nil, err
+		}
+		delay = c.Retry.next(delay)
+	}
+}
+
+func (c *Client) signBlobOnce(ctx context.Context, u string, body []byte) ([]byte, error) {
+	token, err := c.iamTokens.Token(ctx)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, &transportError{err: err}
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, &transportError{err: err}
+	}
+	if !isSuccess(resp.StatusCode) {
+		return nil, parseAPIError(resp.StatusCode, data)
+	}
+	var out struct {
+		SignedBlob string `json:"signedBlob"`
+	}
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	return base64.StdEncoding.DecodeString(out.SignedBlob)
 }
 
 func signRSA(key *rsa.PrivateKey, p []byte) ([]byte, error) {

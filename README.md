@@ -51,7 +51,7 @@ All three clients accept a **service account** key or **user credentials**. For 
 
 When no credentials option is given, every client uses **Application Default Credentials**: `GOOGLE_APPLICATION_CREDENTIALS`, then the gcloud file from `gcloud auth application-default login` (service account or user credentials), then the GCE / Cloud Run / GKE metadata server. `DetectProjectID` takes the project from whichever credentials were found.
 
-Storage signed URLs need a private key. With user or metadata-server credentials, `SignedURL` returns an error unless `GoogleAccessID` and `PrivateKey` or `SignBytes` are set.
+Storage signed URLs are signed locally with a service account key. With metadata-server credentials they are signed through the IAM Credentials `signBlob` API as the VM's service account (it needs `iam.serviceAccounts.signBlob` on itself, e.g. Service Account Token Creator, and the `cloud-platform` scope). With user credentials, `SignedURL` returns an error unless `GoogleAccessID` and `PrivateKey` or `SignBytes` are set.
 
 ```go
 import "github.com/eeertekin/gcp/option"
