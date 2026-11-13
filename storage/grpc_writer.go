@@ -154,7 +154,7 @@ func (c *writeConn) streamError(ctx context.Context) error {
 func (a *appendWriter) firstMessage() wire.Buf {
 	o := a.w.o
 	if a.gen == 0 {
-		res := wire.Buf(nil).Str(1, o.name).Str(2, bucketResourcePrefix+o.bucket).Str(7, a.w.ContentEncoding).Str(13, a.w.ContentType)
+		res := wire.Buf(nil).Str(1, o.name).Str(2, bucketResourcePrefix+o.bucket).Str(7, a.w.ContentEncoding).Str(8, a.w.ContentDisposition).Str(13, a.w.ContentType)
 		for k, v := range a.w.Metadata {
 			res = res.Msg(22, wire.Buf(nil).Str(1, k).Str(2, v))
 		}
@@ -345,7 +345,7 @@ func (a *appendWriter) close(data []byte, finalize bool) (*ObjectAttrs, error) {
 	defer a.c.mu.Unlock()
 	attrs := a.c.resource
 	if attrs == nil {
-		attrs = &ObjectAttrs{Bucket: a.w.o.bucket, Name: a.w.o.name, Generation: a.gen, ContentType: a.w.ContentType}
+		attrs = &ObjectAttrs{Bucket: a.w.o.bucket, Name: a.w.o.name, Generation: a.gen, ContentType: a.w.ContentType, ContentDisposition: a.w.ContentDisposition}
 	}
 	attrs.Size = a.sent
 	return attrs, nil

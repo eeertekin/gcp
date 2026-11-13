@@ -269,3 +269,81 @@ func TestPutObjectAndCreateBucket(t *testing.T) {
 		t.Fatalf("attrs = %+v, %v", a, err)
 	}
 }
+
+func TestJSONContentDisposition(t *testing.T) {
+	const cd = `attachment; filename="report.csv"`
+	for _, tc := range []struct {
+		name string
+		size int
+	}{{"single", 5}, {"resumable", 2*chunk + 5}} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, b := jsonSetup(t)
+			w := b.Object("r.csv").NewWriter(context.Background())
+			w.ContentType = "text/csv"
+			w.ContentDisposition = cd
+			w.ChunkSize = chunk
+			w.Write([]byte(strings.Repeat("x", tc.size)))
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if w.Attrs().ContentDisposition != cd {
+				t.Fatalf("writer attrs disposition = %q", w.Attrs().ContentDisposition)
+			}
+			if o, _ := s.Object(storagetest.Bucket, "r.csv"); o.ContentDisposition != cd || o.ContentType != "text/csv" || len(o.Data) != tc.size {
+				t.Fatalf("stored disposition=%q ct=%q %d bytes", o.ContentDisposition, o.ContentType, len(o.Data))
+			}
+			if a, err := b.Object("r.csv").Attrs(context.Background()); err != nil || a.ContentDisposition != cd {
+				t.Fatalf("attrs = %+v, %v", a, err)
+			}
+		})
+	}
+}
+
+func TestJSONCopyAttrs(t *testing.T) {
+	const cd = `attachment; filename="a.pdf"`
+	s, b := jsonSetup(t)
+	w := b.Object("tmp").NewWriter(context.Background())
+	w.ContentType = "application/octet-stream"
+	w.ContentDisposition = "inline"
+	w.Metadata = map[string]string{"m": "1"}
+	w.Write([]byte("%PDF"))
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c := b.Object("kept").CopierFrom(b.Object("tmp"))
+	if _, err := c.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if o, _ := s.Object(storagetest.Bucket, "kept"); o.ContentType != "application/octet-stream" || o.ContentDisposition != "inline" || o.Metadata["m"] != "1" {
+		t.Fatalf("inherited = %+v", o)
+	}
+
+	c = b.Object("a.pdf").CopierFrom(b.Object("tmp"))
+	c.ContentType = "application/pdf"
+	c.ContentDisposition = cd
+	a, err := c.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.ContentType != "application/pdf" || a.ContentDisposition != cd || a.Metadata != nil || a.Size != 4 {
+		t.Fatalf("attrs = %+v", a)
+	}
+	o, _ := s.Object(storagetest.Bucket, "a.pdf")
+	if o.ContentType != "application/pdf" || o.ContentDisposition != cd || o.Metadata != nil || string(o.Data) != "%PDF" {
+		t.Fatalf("stored = %+v", o)
+	}
+	if n := strings.Count(strings.Join(s.Calls(), "\n"), "REWRITE "+storagetest.Bucket+"/tmp "+storagetest.Bucket+"/a.pdf step-1"); n != 1 {
+		t.Fatalf("rewrite continuation calls = %d\n%q", n, s.Calls())
+	}
+
+	c = b.Object("tagged").CopierFrom(b.Object("tmp"))
+	c.Metadata = map[string]string{"n": "2"}
+	c.ContentEncoding = "identity"
+	if _, err := c.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if o, _ := s.Object(storagetest.Bucket, "tagged"); o.Metadata["n"] != "2" || o.Metadata["m"] != "" || o.ContentEncoding != "identity" || o.ContentDisposition != "" {
+		t.Fatalf("replaced = %+v", o)
+	}
+}

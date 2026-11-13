@@ -60,6 +60,8 @@ func (c *Composer) Run(ctx context.Context) (*ObjectAttrs, error) {
 }
 
 type Copier struct {
+	ObjectAttrs
+
 	dst *ObjectHandle
 	src *ObjectHandle
 }
@@ -84,9 +86,18 @@ func (c *Copier) Run(ctx context.Context) (*ObjectAttrs, error) {
 		q.Set("sourceGeneration", fmt.Sprint(c.src.gen))
 	}
 	base := c.src.url("/rewriteTo/b/" + url.PathEscape(c.dst.bucket) + "/o/" + url.PathEscape(c.dst.name))
+	body, err := json.Marshal(struct {
+		ContentType        string            `json:"contentType,omitempty"`
+		ContentEncoding    string            `json:"contentEncoding,omitempty"`
+		ContentDisposition string            `json:"contentDisposition,omitempty"`
+		Metadata           map[string]string `json:"metadata,omitempty"`
+	}{c.ContentType, c.ContentEncoding, c.ContentDisposition, c.Metadata})
+	if err != nil {
+		return nil, err
+	}
 	header := http.Header{"Content-Type": {"application/json"}}
 	for {
-		resp, _, err := c.dst.c.call(ctx, http.MethodPost, withQuery(base, q), header, []byte("{}"))
+		resp, _, err := c.dst.c.call(ctx, http.MethodPost, withQuery(base, q), header, body)
 		if isNotFound(err) {
 			return nil, ErrObjectNotExist
 		}

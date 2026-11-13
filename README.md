@@ -71,6 +71,7 @@ defer client.Close()
 
 w := client.Bucket("my-bucket").Object("path/file.csv").NewWriter(ctx)
 w.ContentType = "text/csv"
+w.ContentDisposition = `attachment; filename="file.csv"`
 io.Copy(w, f)
 err = w.Close()
 
@@ -83,8 +84,8 @@ url, err := client.Bucket("my-bucket").SignedURL("path/file.csv", &storage.Signe
 })
 ```
 
-- **Uploads:** small objects use a single media upload (multipart when `Writer.Metadata` or `Writer.ContentEncoding` is set); larger objects use resumable uploads in chunks (`Writer.ChunkSize`, default 16 MiB, aligned to 256 KiB). Interrupted chunks resume from the server's committed offset.
-- **Objects:** `Attrs`, `NewReader` / `NewRangeReader`, `Delete`, `Objects` with `Query{Prefix, Delimiter}`, `ComposerFrom`, `CopierFrom`. Preconditions with `If(storage.Conditions{DoesNotExist: true})` or `{GenerationMatch: gen}`, and `Generation(gen)`; a failed precondition is a `*storage.APIError` with `Code` 412.
+- **Uploads:** small objects use a single media upload (multipart when `Writer.Metadata`, `Writer.ContentEncoding` or `Writer.ContentDisposition` is set); larger objects use resumable uploads in chunks (`Writer.ChunkSize`, default 16 MiB, aligned to 256 KiB). Interrupted chunks resume from the server's committed offset.
+- **Objects:** `Attrs` (including `ContentType`, `ContentEncoding`, `ContentDisposition` and `Metadata`), `NewReader` / `NewRangeReader`, `Delete`, `Objects` with `Query{Prefix, Delimiter}`, `ComposerFrom`, `CopierFrom` (set `ContentType`, `ContentEncoding`, `ContentDisposition` or `Metadata` on the `Copier` to replace the destination's metadata instead of inheriting the source's). Preconditions with `If(storage.Conditions{DoesNotExist: true})` or `{GenerationMatch: gen}`, and `Generation(gen)`; a failed precondition is a `*storage.APIError` with `Code` 412.
 - **gRPC and Rapid (zonal) buckets:** `storage.NewGRPCClient` speaks the `google.storage.v2` gRPC API over `net/http`'s HTTP/2 (protobuf encoded by hand), still without dependencies. It covers what zonal buckets offer: appendable writes (`Writer.Append`, `Flush`, `FinalizeOnClose`, takeover with `NewWriterFromAppendableObject`), bidi reads (`BidiReadObject`, which also reads unfinalized objects), `Attrs`, `Objects` and `Delete`, with redirects and routing tokens for writes and reads. Plain uploads, compose and copy are not available over gRPC. gRPC errors map to `*storage.APIError` with the HTTP equivalent in `Code` and the gRPC code name in `Reason`. Unlike the official SDK, `FinalizeOnClose` is read when `Close` runs, so it can be set after the first write.
 
 ```go
@@ -196,7 +197,7 @@ srv.CreateSubscription("s", "t", pubsubtest.SubscriptionConfig{})
 | Package | Tests |
 |---|---|
 | `bigquery` | 59 (incl. paging, deadline-bounded polling, cancel, idempotent retry, ADC) |
-| `storage` | 55 (incl. Google's V4 signing conformance suite, ADC), plus JSON object operations and a gRPC suite that runs against both `storagetest` and a real gRPC server |
+| `storage` | 80 (incl. Google's V4 signing conformance suite, ADC, JSON object operations, and a gRPC suite that runs against both `storagetest` and a real gRPC server) |
 | `pubsub` | 46 (incl. a 600-message end-to-end publish → receive, ADC) |
 
 ```sh

@@ -48,6 +48,8 @@ func parseObject(b []byte) (*ObjectAttrs, error) {
 			a.Size = int64(f.U)
 		case 7:
 			a.ContentEncoding = string(f.Data)
+		case 8:
+			a.ContentDisposition = string(f.Data)
 		case 13:
 			a.ContentType = string(f.Data)
 		case 14:

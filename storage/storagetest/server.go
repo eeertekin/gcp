@@ -43,13 +43,14 @@ const (
 )
 
 type Object struct {
-	Data            []byte
-	ContentType     string
-	ContentEncoding string
-	Generation      int64
-	Metadata        map[string]string
-	Created         time.Time
-	Finalized       time.Time
+	Data               []byte
+	ContentType        string
+	ContentEncoding    string
+	ContentDisposition string
+	Generation         int64
+	Metadata           map[string]string
+	Created            time.Time
+	Finalized          time.Time
 
 	epoch    uint64
 	statSize int64
@@ -588,6 +589,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		s.calls = append(s.calls, "MULTIPART "+bucket+"/"+name)
 		obj := s.store(bucket, name, meta.ContentType, meta.Metadata, data)
 		obj.ContentEncoding = meta.ContentEncoding
+		obj.ContentDisposition = meta.ContentDisposition
 		s.writeObject(w, bucket, name, obj)
 	case "resumable":
 		var meta objectMeta
@@ -617,9 +619,10 @@ func (s *Server) store(bucket, name, contentType string, metadata map[string]str
 }
 
 type objectMeta struct {
-	ContentType     string            `json:"contentType"`
-	ContentEncoding string            `json:"contentEncoding"`
-	Metadata        map[string]string `json:"metadata"`
+	ContentType        string            `json:"contentType"`
+	ContentEncoding    string            `json:"contentEncoding"`
+	ContentDisposition string            `json:"contentDisposition"`
+	Metadata           map[string]string `json:"metadata"`
 }
 
 func parseMultipart(contentType string, body []byte) (objectMeta, []byte, error) {
@@ -671,6 +674,9 @@ func objectJSON(bucket, name string, obj *Object) map[string]any {
 	}
 	if obj.ContentEncoding != "" {
 		m["contentEncoding"] = obj.ContentEncoding
+	}
+	if obj.ContentDisposition != "" {
+		m["contentDisposition"] = obj.ContentDisposition
 	}
 	return m
 }
@@ -791,6 +797,7 @@ func (s *Server) chunk(w http.ResponseWriter, r *http.Request, partial bool) {
 		}
 		sess.done = s.store(sess.bucket, sess.name, sess.contentType, sess.meta.Metadata, sess.data)
 		sess.done.ContentEncoding = sess.meta.ContentEncoding
+		sess.done.ContentDisposition = sess.meta.ContentDisposition
 		s.writeObject(w, sess.bucket, sess.name, sess.done)
 		return
 	}

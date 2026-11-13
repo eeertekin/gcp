@@ -194,3 +194,21 @@ func TestJSONFlushNeedsGRPC(t *testing.T) {
 		t.Fatal("flush on JSON writer succeeded")
 	}
 }
+
+func TestGRPCContentDisposition(t *testing.T) {
+	const cd = `inline; filename="log.txt"`
+	s, _, b := grpcSetup(t)
+	w := appendWriter(b.Object("log"))
+	w.FinalizeOnClose = true
+	w.ContentDisposition = cd
+	w.Write([]byte("abc"))
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if o, _ := s.Object(storagetest.Bucket, "log"); o.ContentDisposition != cd {
+		t.Fatalf("stored disposition = %q", o.ContentDisposition)
+	}
+	if a, err := b.Object("log").Attrs(context.Background()); err != nil || a.ContentDisposition != cd {
+		t.Fatalf("attrs = %+v, %v", a, err)
+	}
+}

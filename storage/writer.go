@@ -24,12 +24,13 @@ var errWriterClosed = errors.New("storage: writer is closed")
 // Writer buffers up to ChunkSize bytes. Objects that fit in a single chunk are
 // sent in one request; larger objects use a resumable upload session.
 type Writer struct {
-	ContentType     string
-	ContentEncoding string
-	Metadata        map[string]string
-	ChunkSize       int
-	Append          bool
-	FinalizeOnClose bool
+	ContentType        string
+	ContentEncoding    string
+	ContentDisposition string
+	Metadata           map[string]string
+	ChunkSize          int
+	Append             bool
+	FinalizeOnClose    bool
 
 	ctx     context.Context
 	o       *ObjectHandle
@@ -176,15 +177,16 @@ func (w *Writer) uploadURL(uploadType string) string {
 }
 
 func (w *Writer) hasMetadata() bool {
-	return len(w.Metadata) > 0 || w.ContentEncoding != ""
+	return len(w.Metadata) > 0 || w.ContentEncoding != "" || w.ContentDisposition != ""
 }
 
 func (w *Writer) metadataJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		ContentType     string            `json:"contentType"`
-		ContentEncoding string            `json:"contentEncoding,omitempty"`
-		Metadata        map[string]string `json:"metadata,omitempty"`
-	}{w.contentType(), w.ContentEncoding, w.Metadata})
+		ContentType        string            `json:"contentType"`
+		ContentEncoding    string            `json:"contentEncoding,omitempty"`
+		ContentDisposition string            `json:"contentDisposition,omitempty"`
+		Metadata           map[string]string `json:"metadata,omitempty"`
+	}{w.contentType(), w.ContentEncoding, w.ContentDisposition, w.Metadata})
 }
 
 func (w *Writer) uploadSingle() error {

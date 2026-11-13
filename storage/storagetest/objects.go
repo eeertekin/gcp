@@ -100,6 +100,9 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 	s.calls = append(s.calls, "READ "+key+" "+r.Header.Get("Range"))
 	data := obj.Data
+	if obj.ContentDisposition != "" {
+		w.Header().Set("Content-Disposition", obj.ContentDisposition)
+	}
 	if obj.ContentEncoding == "gzip" {
 		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			w.Header().Set("Content-Encoding", "gzip")
@@ -184,6 +187,11 @@ func (s *Server) handleCompose(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRewrite(w http.ResponseWriter, r *http.Request) {
+	var meta objectMeta
+	if err := json.NewDecoder(r.Body).Decode(&meta); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "invalid", err.Error())
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.authorized(w, r) {
@@ -209,7 +217,11 @@ func (s *Server) handleRewrite(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"kind": "storage#rewriteResponse", "done": false, "rewriteToken": "step-1"})
 		return
 	}
-	dst := s.store(bucket, name, obj.ContentType, obj.Metadata, slices.Clone(obj.Data))
-	dst.ContentEncoding = obj.ContentEncoding
+	if meta.ContentType == "" && meta.ContentEncoding == "" && meta.ContentDisposition == "" && meta.Metadata == nil {
+		meta = objectMeta{obj.ContentType, obj.ContentEncoding, obj.ContentDisposition, obj.Metadata}
+	}
+	dst := s.store(bucket, name, meta.ContentType, meta.Metadata, slices.Clone(obj.Data))
+	dst.ContentEncoding = meta.ContentEncoding
+	dst.ContentDisposition = meta.ContentDisposition
 	json.NewEncoder(w).Encode(map[string]any{"kind": "storage#rewriteResponse", "done": true, "resource": objectJSON(bucket, name, dst)})
 }
